@@ -1,0 +1,7 @@
+.env
+.venv/
+state/
+__pycache__/
+*.log
+bot.lock
+_tmp_*
