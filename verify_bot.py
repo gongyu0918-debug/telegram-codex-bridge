@@ -270,6 +270,15 @@ async def verify() -> int:
             )
         else:
             print("default(effort): ok")
+        available_models = bot.get_available_models()
+        if not available_models:
+            failures.append("models(sync): 没有读到本机模型列表")
+        else:
+            print(f"models(sync): ok ({len(available_models)})")
+        if "medium" not in bot.get_supported_efforts_for_model("gpt-5.4"):
+            failures.append("efforts(sync): gpt-5.4 没有 medium")
+        else:
+            print("efforts(sync): ok")
 
         if target_thread:
             original_archive_current_thread = conversations.archive_current_thread
@@ -543,6 +552,65 @@ async def verify() -> int:
                     checks.append(("command(text)", "ok"))
                 else:
                     failures.append("command(text): 普通文本入口没有启动")
+
+                original_save_file = bot.save_telegram_file
+                original_dispatch_message = bot.dispatch_chat_message
+                media_prompts: list[str] = []
+
+                async def fake_save_file(context_arg, file_id: str, target_dir: Path, filename: str) -> Path:
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    target = target_dir / filename
+                    if target.suffix.lower() == ".txt":
+                        target.write_text("hello from attachment", encoding="utf-8")
+                    else:
+                        target.write_bytes(b"fake-image")
+                    return target
+
+                async def fake_dispatch_message(update_arg, context_arg, *, prompt: str, force_new: bool = False) -> None:
+                    media_prompts.append(prompt)
+
+                bot.save_telegram_file = fake_save_file  # type: ignore[assignment]
+                bot.dispatch_chat_message = fake_dispatch_message  # type: ignore[assignment]
+                try:
+                    media_bot = FakeBot()
+                    application.bot = media_bot
+
+                    photo_message = FakeSentMessage(media_bot, chat_id, 0, "")
+                    photo_message.caption = "看这张图"
+                    photo_message.photo = [SimpleNamespace(file_id="photo-1", file_unique_id="photo-1")]
+                    photo_message.document = None
+                    photo_update = SimpleNamespace(
+                        effective_chat=SimpleNamespace(id=chat_id),
+                        effective_message=photo_message,
+                        callback_query=None,
+                    )
+                    photo_context = SimpleNamespace(application=application, args=[], bot=media_bot)
+                    await bot.media_message(photo_update, photo_context)
+
+                    doc_message = FakeSentMessage(media_bot, chat_id, 0, "")
+                    doc_message.caption = "读这个文件"
+                    doc_message.photo = None
+                    doc_message.document = SimpleNamespace(
+                        file_id="doc-1",
+                        file_unique_id="doc-1",
+                        file_name="note.txt",
+                    )
+                    doc_update = SimpleNamespace(
+                        effective_chat=SimpleNamespace(id=chat_id),
+                        effective_message=doc_message,
+                        callback_query=None,
+                    )
+                    doc_context = SimpleNamespace(application=application, args=[], bot=media_bot)
+                    await bot.media_message(doc_update, doc_context)
+                finally:
+                    bot.save_telegram_file = original_save_file  # type: ignore[assignment]
+                    bot.dispatch_chat_message = original_dispatch_message  # type: ignore[assignment]
+
+                joined_media = "\n".join(media_prompts)
+                if "附件" in joined_media and "hello from attachment" in joined_media and "photo-1.jpg" in joined_media:
+                    checks.append(("command(media)", "ok"))
+                else:
+                    failures.append("command(media): 图片或文件附件提示没有生成")
 
                 stop_bot = await run_command(bot.stop_command, application, chat_id, text="/stop")
                 if "已中断。" in stop_bot.all_text():

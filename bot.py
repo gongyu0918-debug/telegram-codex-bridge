@@ -1866,6 +1866,114 @@ def format_effort_name(effort: str | None) -> str:
     return f"{effort} ({label})" if label else effort
 
 
+def get_models_cache_path() -> Path:
+    return Path.home() / ".codex" / "models_cache.json"
+
+
+def format_model_name(model: str) -> str:
+    parts = []
+    for part in model.split("-"):
+        lowered = part.lower()
+        if lowered == "gpt":
+            parts.append("GPT")
+        elif lowered == "codex":
+            parts.append("Codex")
+        elif lowered == "mini":
+            parts.append("Mini")
+        elif lowered == "spark":
+            parts.append("Spark")
+        elif lowered == "max":
+            parts.append("Max")
+        else:
+            parts.append(part)
+    return "-".join(parts)
+
+
+def load_local_model_catalog() -> list[dict[str, Any]]:
+    path = get_models_cache_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return []
+    catalog: list[dict[str, Any]] = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        slug = str(item.get("slug") or "").strip()
+        if not slug:
+            continue
+        visibility = str(item.get("visibility") or "").strip().lower()
+        if visibility and visibility != "list":
+            continue
+        efforts = []
+        for effort_item in item.get("supported_reasoning_levels") or []:
+            if not isinstance(effort_item, dict):
+                continue
+            effort = str(effort_item.get("effort") or "").strip().lower()
+            if effort in VALID_REASONING_EFFORTS:
+                efforts.append(effort)
+        catalog.append(
+            {
+                "slug": slug,
+                "label": format_model_name(slug),
+                "efforts": efforts or list(VALID_REASONING_EFFORTS),
+            }
+        )
+    return catalog
+
+
+def get_available_models() -> list[dict[str, Any]]:
+    catalog = load_local_model_catalog()
+    if catalog:
+        return catalog
+    return [
+        {
+            "slug": slug,
+            "label": format_model_name(slug),
+            "efforts": list(VALID_REASONING_EFFORTS),
+        }
+        for slug in SUGGESTED_CODEX_MODELS
+    ]
+
+
+def resolve_model_alias(raw: str) -> str:
+    candidate = raw.strip()
+    if not candidate:
+        return candidate
+    lowered = candidate.lower()
+    for item in get_available_models():
+        if lowered in {item["slug"].lower(), item["label"].lower()}:
+            return str(item["slug"])
+    return candidate
+
+
+def get_supported_efforts_for_model(model: str | None) -> tuple[str, ...]:
+    active = (model or "").strip().lower()
+    for item in get_available_models():
+        if item["slug"].lower() == active:
+            return tuple(item["efforts"])
+    return VALID_REASONING_EFFORTS
+
+
+def resolve_effort_alias(raw: str) -> str | None:
+    lowered = raw.strip().lower()
+    if lowered in {"default", "reset", "auto"}:
+        return None
+    if lowered in VALID_REASONING_EFFORTS:
+        return lowered
+    label_map = {
+        "极低": "minimal",
+        "低": "low",
+        "中": "medium",
+        "高": "high",
+        "超高": "xhigh",
+    }
+    return label_map.get(raw.strip())
+
+
 async def reject_unauthorized(update: Update) -> None:
     chat = update.effective_chat
     if not chat or not update.effective_message:
@@ -2514,17 +2622,19 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             chat_id,
             repo_key,
         )
-        current = effective_model or "默认"
-        suggested = "\n".join(SUGGESTED_CODEX_MODELS)
+        current = effective_model or settings.codex_model or "gpt-5.4"
+        suggested = "\n".join(
+            f"{item['label']} -> {item['slug']}" for item in get_available_models()
+        )
         await update.effective_message.reply_text(
             "\n".join(
                 [
-                    f"当前模型: {current}",
+                    f"当前模型: {format_model_name(current)} -> {current}",
                     "用法: /model <模型名>",
                     "恢复默认: /model default",
-                    f"默认模型: {settings.codex_model or 'gpt-5.4'}",
+                    f"默认模型: {format_model_name(settings.codex_model or 'gpt-5.4')} -> {settings.codex_model or 'gpt-5.4'}",
                     "",
-                    "常用模型",
+                    "本机模型列表",
                     suggested,
                 ]
             )
@@ -2534,12 +2644,11 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     raw = context.args[0].strip()
     if raw.lower() == "list":
         await update.effective_message.reply_text(
-            "常用模型\n"
-            + "\n".join(SUGGESTED_CODEX_MODELS)
-            + "\n\n说明: Codex 还能接收 Responses API 可用的其他模型名。"
+            "本机模型列表\n"
+            + "\n".join(f"{item['label']} -> {item['slug']}" for item in get_available_models())
         )
         return
-    model = None if raw.lower() in {"default", "reset", "auto"} else raw
+    model = None if raw.lower() in {"default", "reset", "auto"} else resolve_model_alias(raw)
     old_thread_id = store.get_thread_id(chat_id)
     if old_thread_id and settings.auto_archive_on_new:
         try:
@@ -2552,7 +2661,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     store.set_model(chat_id, model)
     target_model = model or settings.codex_model or "gpt-5.4"
     await update.effective_message.reply_text(
-        f"已切换模型: {target_model}\n下一条消息会用新配置开线程。"
+        f"已切换模型: {format_model_name(target_model)} -> {target_model}\n下一条消息会用新配置开线程。"
     )
 
 
@@ -2573,37 +2682,46 @@ async def effort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.effective_message.reply_text("当前还在回复，先 /stop。")
         return
 
+    repo_key = resolve_repo_key(chat_id, settings, store)
+    active_model, effective_effort = await resolve_effective_runtime_info(
+        settings,
+        store,
+        client,
+        chat_id,
+        repo_key,
+    )
+    allowed_efforts = get_supported_efforts_for_model(active_model or settings.codex_model)
+
     if not context.args:
-        repo_key = resolve_repo_key(chat_id, settings, store)
-        _, effective_effort = await resolve_effective_runtime_info(
-            settings,
-            store,
-            client,
-            chat_id,
-            repo_key,
-        )
         current = format_effort_name(effective_effort or settings.codex_reasoning_effort)
-        allowed = "|".join(VALID_REASONING_EFFORTS)
+        allowed = "|".join(allowed_efforts)
         await update.effective_message.reply_text(
             "\n".join(
                 [
                     f"当前思考强度: {current}",
                     f"用法: /effort <{allowed}>",
                     "恢复默认: /effort default",
+                    f"当前模型: {format_model_name(active_model or settings.codex_model or 'gpt-5.4')}",
                     "常用档位: low(低), medium(中), high(高), xhigh(超高)",
                 ]
             )
         )
         return
 
-    raw = context.args[0].strip().lower()
-    if raw in {"default", "reset", "auto"}:
+    raw = context.args[0].strip()
+    lowered = raw.lower()
+    if lowered in {"default", "reset", "auto"}:
         effort = None
-    elif raw in VALID_REASONING_EFFORTS:
-        effort = raw
     else:
+        effort = resolve_effort_alias(raw)
+        if effort is None:
+            await update.effective_message.reply_text(
+                "思考强度无效。\n可用值: " + ", ".join(allowed_efforts)
+            )
+            return
+    if effort is not None and effort not in allowed_efforts:
         await update.effective_message.reply_text(
-            "思考强度无效。\n可用值: minimal, low, medium, high, xhigh"
+            "思考强度无效。\n可用值: " + ", ".join(allowed_efforts)
         )
         return
 
