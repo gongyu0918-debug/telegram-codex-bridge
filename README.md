@@ -13,14 +13,12 @@ This project is an unofficial community bridge. It uses the Telegram Bot API plu
 - Thread history, resume, archive, full transcript export, and summary
 - Per-chat model, reasoning effort, access mode, and verbosity settings
 - Attachment intake for images and documents
-- Local usage snapshot from `~/.codex/state_5.sqlite`
 - Inline buttons and Telegram command menu with bilingual labels
 
 ## Commands
 
 - `/start` help and current config
 - `/status` current thread status
-- `/usage` local usage snapshot
 - `/repos` list repos
 - `/repo <name>` switch repo and reset thread
 - `/new` start a fresh thread
@@ -66,25 +64,13 @@ CODEX_COMMAND=cmd /c npx @openai/codex@latest
 CODEX_APPROVAL=never
 CODEX_SANDBOX=danger-full-access
 CODEX_DEFAULT_SANDBOX=workspace-write
-CODEX_MODEL=
-CODEX_REASONING_EFFORT=
+CODEX_MODEL=gpt-5.4
+CODEX_REASONING_EFFORT=medium
 MAX_PROMPT_CHARS=12000
 STREAM_EDIT_INTERVAL=0.8
 MAX_MESSAGE_CHARS=3800
 AUTO_ARCHIVE_ON_NEW=true
 ```
-
-## Usage data
-
-`/usage` shows a local estimate only. It reads thread totals from `~/.codex/state_5.sqlite` and reports:
-
-- current thread tokens
-- this chat's thread history totals
-- current repo totals
-- recent 5-hour active-thread totals
-- all local thread totals
-
-It does not show the official remaining quota of your ChatGPT Codex plan. OpenAI documents Codex plan limits, but there is currently no public exact remaining-quota API for ChatGPT plan usage.
 
 ## Security
 

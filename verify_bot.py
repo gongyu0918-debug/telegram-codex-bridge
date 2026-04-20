@@ -260,15 +260,16 @@ async def verify() -> int:
         else:
             print(f"status(runtime): ok model={model or 'default'} effort={effort or 'default'}")
 
-        try:
-            usage_text = bot.build_usage_text(settings, store, chat_id)
-        except Exception as exc:
-            failures.append(f"usage(snapshot): {type(exc).__name__}: {exc}")
+        if settings.codex_model != "gpt-5.4":
+            failures.append(f"default(model): 当前默认模型是 {settings.codex_model!r}")
         else:
-            if "官方剩余额度" not in usage_text or "当前线程累计 tokens" not in usage_text:
-                failures.append("usage(snapshot): 输出缺少关键字段")
-            else:
-                print("usage(snapshot): ok")
+            print("default(model): ok")
+        if settings.codex_reasoning_effort != "medium":
+            failures.append(
+                f"default(effort): 当前默认思考强度是 {settings.codex_reasoning_effort!r}"
+            )
+        else:
+            print("default(effort): ok")
 
         if target_thread:
             original_archive_current_thread = conversations.archive_current_thread
@@ -358,12 +359,6 @@ async def verify() -> int:
                     checks.append(("command(status)", "ok"))
                 else:
                     failures.append("command(status): 缺少 model 或 polling 字段")
-
-                usage_bot = await run_command(bot.usage_command, application, chat_id, text="/usage")
-                if "官方剩余额度" in usage_bot.all_text():
-                    checks.append(("command(usage)", "ok"))
-                else:
-                    failures.append("command(usage): 没有返回用量说明")
 
                 verbose_info_bot = await run_command(bot.verbose_command, application, chat_id, text="/verbose")
                 if "thinking" in verbose_info_bot.all_text():
@@ -559,12 +554,12 @@ async def verify() -> int:
                     bot.control_callback,
                     application,
                     chat_id,
-                    data="control:usage",
+                    data="control:effort:medium",
                 )
-                if "官方剩余额度" in control_bot.all_text():
-                    checks.append(("callback(control:usage)", "ok"))
+                if "已切换思考强度" in control_bot.all_text():
+                    checks.append(("callback(control:effort)", "ok"))
                 else:
-                    failures.append("callback(control:usage): 没有返回用量")
+                    failures.append("callback(control:effort): 没有切换思考强度")
 
                 thread_summary_bot, _ = await run_callback(
                     bot.thread_callback,

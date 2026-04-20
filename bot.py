@@ -9,7 +9,6 @@ import logging
 import os
 import re
 import shlex
-import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -42,6 +41,7 @@ _mutex_handle: int | None = None
 VALID_VERBOSE_LEVELS = ("off", "thinking", "new", "all", "verbose")
 THREAD_CALLBACK_PREFIX = "thread"
 STREAM_BUFFER_THRESHOLD = 40
+SUMMARY_MODEL_TIMEOUT_SECONDS = 20
 
 
 def parse_int_set(raw: str) -> set[int]:
@@ -224,9 +224,9 @@ class Settings:
             or "danger-full-access",
             codex_default_sandbox=os.getenv("CODEX_DEFAULT_SANDBOX", "workspace-write").strip()
             or "workspace-write",
-            codex_model=os.getenv("CODEX_MODEL", "").strip() or None,
-            codex_reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "").strip()
-            or None,
+            codex_model=os.getenv("CODEX_MODEL", "gpt-5.4").strip() or "gpt-5.4",
+            codex_reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "medium").strip()
+            or "medium",
             max_prompt_chars=int(os.getenv("MAX_PROMPT_CHARS", "12000")),
             stream_edit_interval=float(os.getenv("STREAM_EDIT_INTERVAL", "0.8")),
             max_message_chars=int(os.getenv("MAX_MESSAGE_CHARS", "3800")),
@@ -378,19 +378,6 @@ class PollingHealth:
     last_conflict_at: float | None = None
     last_error_text: str | None = None
     alerted_conflict: bool = False
-
-
-@dataclass
-class UsageSnapshot:
-    current_thread_tokens: int | None
-    chat_thread_count: int
-    chat_tokens: int
-    repo_thread_count: int
-    repo_tokens: int
-    active_window_count: int
-    active_window_tokens: int
-    total_thread_count: int
-    total_tokens: int
 
 
 @dataclass
@@ -1354,101 +1341,6 @@ def get_chat_sandbox(settings: Settings, store: SessionStore, chat_id: int) -> s
     return store.get_sandbox(chat_id) or settings.codex_sandbox
 
 
-def get_codex_state_db_path() -> Path:
-    return Path.home() / ".codex" / "state_5.sqlite"
-
-
-def normalize_codex_cwd(path: Path) -> str:
-    resolved = str(path.resolve())
-    return resolved if resolved.startswith("\\\\?\\") else f"\\\\?\\{resolved}"
-
-
-def format_number(value: int | None) -> str:
-    if value is None:
-        return "未知"
-    return f"{value:,}"
-
-
-def load_usage_snapshot(
-    settings: Settings,
-    store: SessionStore,
-    chat_id: int,
-) -> UsageSnapshot:
-    db_path = get_codex_state_db_path()
-    if not db_path.exists():
-        raise RuntimeError(f"找不到 Codex 状态库: {db_path}")
-
-    repo_key = resolve_repo_key(chat_id, settings, store)
-    repo_path = settings.repos.get(repo_key) if repo_key else None
-    repo_cwd = normalize_codex_cwd(repo_path) if repo_path else None
-    history_ids = set(store.get_thread_history(chat_id))
-    current_thread_id = store.get_thread_id(chat_id)
-    active_window_start = int(time.time()) - 5 * 3600
-
-    conn = sqlite3.connect(str(db_path))
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id, tokens_used, updated_at, cwd FROM threads")
-        rows = [
-            {
-                "id": str(thread_id or "").strip(),
-                "tokens_used": int(tokens_used or 0),
-                "updated_at": int(updated_at or 0),
-                "cwd": str(cwd or "").strip(),
-            }
-            for thread_id, tokens_used, updated_at, cwd in cur.fetchall()
-        ]
-    finally:
-        conn.close()
-
-    current_thread_tokens = next(
-        (row["tokens_used"] for row in rows if row["id"] == current_thread_id),
-        None,
-    )
-    chat_rows = [row for row in rows if row["id"] in history_ids]
-    repo_rows = [row for row in rows if repo_cwd and row["cwd"] == repo_cwd]
-    active_rows = [row for row in rows if row["updated_at"] >= active_window_start]
-
-    return UsageSnapshot(
-        current_thread_tokens=current_thread_tokens,
-        chat_thread_count=len(chat_rows),
-        chat_tokens=sum(row["tokens_used"] for row in chat_rows),
-        repo_thread_count=len(repo_rows),
-        repo_tokens=sum(row["tokens_used"] for row in repo_rows),
-        active_window_count=len(active_rows),
-        active_window_tokens=sum(row["tokens_used"] for row in active_rows),
-        total_thread_count=len(rows),
-        total_tokens=sum(row["tokens_used"] for row in rows),
-    )
-
-
-def build_usage_text(
-    settings: Settings,
-    store: SessionStore,
-    chat_id: int,
-) -> str:
-    snapshot = load_usage_snapshot(settings, store, chat_id)
-    lines = [
-        "用量",
-        "官方剩余额度: 本机 CLI 和 state_5.sqlite 没有公开剩余额度字段",
-        "当前显示的是本机 Codex 的本地估算用量",
-        "",
-        f"当前线程累计 tokens: {format_number(snapshot.current_thread_tokens)}",
-        f"这个 chat 历史线程: {snapshot.chat_thread_count} 个",
-        f"这个 chat 历史累计 tokens: {format_number(snapshot.chat_tokens)}",
-        f"当前仓库累计线程: {snapshot.repo_thread_count} 个",
-        f"当前仓库累计 tokens: {format_number(snapshot.repo_tokens)}",
-        "",
-        f"近 5 小时活跃线程: {snapshot.active_window_count} 个",
-        f"近 5 小时活跃线程累计 tokens: {format_number(snapshot.active_window_tokens)}",
-        f"本机全部线程: {snapshot.total_thread_count} 个",
-        f"本机全部累计 tokens: {format_number(snapshot.total_tokens)}",
-        "",
-        "说明: 近 5 小时 token 按活跃线程当前总量估算，会偏大。",
-    ]
-    return "\n".join(lines)
-
-
 def get_chat_verbose(store: SessionStore, chat_id: int) -> str:
     return store.get_verbose_level(chat_id) or "thinking"
 
@@ -1492,17 +1384,23 @@ def build_control_keyboard() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton("状态 Status", callback_data="control:status"),
-                InlineKeyboardButton("用量 Usage", callback_data="control:usage"),
                 InlineKeyboardButton("停止 Stop", callback_data="control:stop"),
+                InlineKeyboardButton("新线程 New", callback_data="control:new"),
             ],
             [
                 InlineKeyboardButton("默认 Default", callback_data="control:access:default"),
                 InlineKeyboardButton("完全 Full", callback_data="control:access:full"),
             ],
             [
-                InlineKeyboardButton("默认模型 Auto", callback_data="control:model:default"),
-                InlineKeyboardButton("5.3-Codex", callback_data="control:model:gpt-5.3-codex"),
-                InlineKeyboardButton("Mini", callback_data="control:model:codex-mini-latest"),
+                InlineKeyboardButton("GPT-5.4", callback_data="control:model:gpt-5.4"),
+                InlineKeyboardButton("5.4 Mini", callback_data="control:model:gpt-5.4-mini"),
+                InlineKeyboardButton("5.3 Codex", callback_data="control:model:gpt-5.3-codex"),
+            ],
+            [
+                InlineKeyboardButton("低 Low", callback_data="control:effort:low"),
+                InlineKeyboardButton("中 Medium", callback_data="control:effort:medium"),
+                InlineKeyboardButton("高 High", callback_data="control:effort:high"),
+                InlineKeyboardButton("超高 XHigh", callback_data="control:effort:xhigh"),
             ],
         ]
     )
@@ -1919,7 +1817,6 @@ def telegram_menu_commands() -> list[tuple[str, str]]:
     return [
         ("start", "帮助 / Help"),
         ("status", "查看状态 / Status"),
-        ("usage", "查看用量 / Usage"),
         ("new", "新开线程 / New thread"),
         ("repos", "仓库列表 / Repos"),
         ("repo", "切换仓库 / Switch repo"),
@@ -1940,15 +1837,33 @@ def telegram_menu_commands() -> list[tuple[str, str]]:
 
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+EFFORT_LABELS = {
+    "minimal": "极低",
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+    "xhigh": "超高",
+}
 
 # 这里只放常见、稳定、好解释的候选项。
 # Codex 实际上能接收 Responses API 可用模型名，但 Telegram 菜单里需要给用户一份短清单。
 SUGGESTED_CODEX_MODELS = (
-    "gpt-5.3-codex",
+    "gpt-5.4",
+    "gpt-5.2-codex",
     "gpt-5.1-codex-max",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2",
     "gpt-5.1-codex-mini",
-    "codex-mini-latest",
 )
+
+
+def format_effort_name(effort: str | None) -> str:
+    if not effort:
+        return "medium (中)"
+    label = EFFORT_LABELS.get(effort)
+    return f"{effort} ({label})" if label else effort
 
 
 async def reject_unauthorized(update: Update) -> None:
@@ -2056,8 +1971,8 @@ async def build_status_text(
     lines = [
         f"repo: {repo_key}",
         f"thread: {thread_id}",
-        f"model: {effective_model or '默认'}",
-        f"effort: {effective_effort or '默认'}",
+        f"model: {effective_model or settings.codex_model or 'gpt-5.4'}",
+        f"effort: {format_effort_name(effective_effort or settings.codex_reasoning_effort)}",
         f"verbose: {get_chat_verbose(store, chat_id)}",
         f"access: {describe_access_mode(settings, effective_sandbox)}",
         f"sandbox: {effective_sandbox}",
@@ -2327,8 +2242,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         chat_id,
         current_repo,
     )
-    current_model = effective_model or "默认"
-    current_effort = effective_effort or "默认"
+    current_model = effective_model or settings.codex_model or "gpt-5.4"
+    current_effort = format_effort_name(effective_effort or settings.codex_reasoning_effort)
     current_sandbox = get_chat_sandbox(settings, store, chat_id)
     current_verbose = get_chat_verbose(store, chat_id)
 
@@ -2353,7 +2268,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "/model [模型名] 查看或切换模型 / Model",
             "/effort [minimal|low|medium|high|xhigh] 查看或切换思考强度 / Effort",
             "/status 看当前线程 / Status",
-            "/usage 看本地估算用量 / Usage",
             "/stop 中断当前回复 / Stop",
             "",
             "仓库",
@@ -2474,24 +2388,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         health,
         chat_id,
     )
-    await update.effective_message.reply_text(text, reply_markup=build_control_keyboard())
-
-
-async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings: Settings = context.application.bot_data["settings"]
-    store: SessionStore = context.application.bot_data["store"]
-    if not ensure_authorized(update, settings):
-        await reject_unauthorized(update)
-        return
-    mark_poll_ok(context.application)
-    await bootstrap_notice(update, settings)
-
-    assert update.effective_chat is not None
-    chat_id = update.effective_chat.id
-    try:
-        text = build_usage_text(settings, store, chat_id)
-    except Exception as exc:
-        text = f"用量读取失败\n{type(exc).__name__}: {exc}"
     await update.effective_message.reply_text(text, reply_markup=build_control_keyboard())
 
 
@@ -2626,6 +2522,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     f"当前模型: {current}",
                     "用法: /model <模型名>",
                     "恢复默认: /model default",
+                    f"默认模型: {settings.codex_model or 'gpt-5.4'}",
                     "",
                     "常用模型",
                     suggested,
@@ -2653,8 +2550,9 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         store.clear_thread_id(chat_id)
     store.set_model(chat_id, model)
+    target_model = model or settings.codex_model or "gpt-5.4"
     await update.effective_message.reply_text(
-        f"已切换模型: {model or '默认'}\n下一条消息会用新配置开线程。"
+        f"已切换模型: {target_model}\n下一条消息会用新配置开线程。"
     )
 
 
@@ -2684,10 +2582,17 @@ async def effort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             chat_id,
             repo_key,
         )
-        current = effective_effort or "默认"
+        current = format_effort_name(effective_effort or settings.codex_reasoning_effort)
         allowed = "|".join(VALID_REASONING_EFFORTS)
         await update.effective_message.reply_text(
-            f"当前思考强度: {current}\n用法: /effort <{allowed}>\n恢复默认: /effort default"
+            "\n".join(
+                [
+                    f"当前思考强度: {current}",
+                    f"用法: /effort <{allowed}>",
+                    "恢复默认: /effort default",
+                    "常用档位: low(低), medium(中), high(高), xhigh(超高)",
+                ]
+            )
         )
         return
 
@@ -2712,8 +2617,9 @@ async def effort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         store.clear_thread_id(chat_id)
     store.set_reasoning_effort(chat_id, effort)
+    target_effort = format_effort_name(effort or settings.codex_reasoning_effort)
     await update.effective_message.reply_text(
-        f"已切换思考强度: {effort or '默认'}\n下一条消息会用新配置开线程。"
+        f"已切换思考强度: {target_effort}\n下一条消息会用新配置开线程。"
     )
 
 
@@ -3117,7 +3023,7 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 build_thread_runtime_config(settings, store, chat_id),
                 transcript,
             ),
-            timeout=35,
+            timeout=SUMMARY_MODEL_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         await edit_message_safe(
@@ -3379,20 +3285,14 @@ async def control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
         return
 
-    if action == "usage":
-        try:
-            text = build_usage_text(settings, store, chat_id)
-        except Exception as exc:
-            text = f"用量读取失败\n{type(exc).__name__}: {exc}"
-        try:
-            await query.edit_message_text(text=text, reply_markup=build_control_keyboard())
-        except BadRequest:
-            pass
-        return
-
     if action == "stop":
         context.args = []
         await stop_command(update, context)
+        return
+
+    if action == "new":
+        context.args = []
+        await new_command(update, context)
         return
 
     if action == "access" and len(parts) >= 3:
@@ -3403,6 +3303,11 @@ async def control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if action == "model" and len(parts) >= 3:
         context.args = [parts[2]]
         await model_command(update, context)
+        return
+
+    if action == "effort" and len(parts) >= 3:
+        context.args = [parts[2]]
+        await effort_command(update, context)
         return
 
 
@@ -3487,7 +3392,6 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("repos", repos_command))
     application.add_handler(CommandHandler("repo", repo_command))
     application.add_handler(CommandHandler("new", new_command))
-    application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("threads", threads_command))
     application.add_handler(CommandHandler("use", use_command))
     application.add_handler(CommandHandler("history", history_command))

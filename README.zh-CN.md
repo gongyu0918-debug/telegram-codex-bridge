@@ -13,14 +13,12 @@
 - 历史线程、切回、归档、全文导出、摘要压缩
 - 按 chat 保存模型、思考强度、访问权限、显示档位
 - 支持图片和文件附件
-- `/usage` 读取本机 `~/.codex/state_5.sqlite` 做用量估算
 - slash 菜单和内联按钮采用中英双语
 
 ## 命令
 
 - `/start` 帮助和当前配置
 - `/status` 当前线程状态
-- `/usage` 本地用量估算
 - `/repos` 仓库列表
 - `/repo <name>` 切仓库并重置线程
 - `/new` 新开线程
@@ -66,25 +64,13 @@ CODEX_COMMAND=cmd /c npx @openai/codex@latest
 CODEX_APPROVAL=never
 CODEX_SANDBOX=danger-full-access
 CODEX_DEFAULT_SANDBOX=workspace-write
-CODEX_MODEL=
-CODEX_REASONING_EFFORT=
+CODEX_MODEL=gpt-5.4
+CODEX_REASONING_EFFORT=medium
 MAX_PROMPT_CHARS=12000
 STREAM_EDIT_INTERVAL=0.8
 MAX_MESSAGE_CHARS=3800
 AUTO_ARCHIVE_ON_NEW=true
 ```
-
-## 用量说明
-
-`/usage` 显示的是本机估算值，不是 OpenAI 官方套餐账单值。它会读取 `~/.codex/state_5.sqlite` 里的线程累计 `tokens_used`，展示：
-
-- 当前线程累计 tokens
-- 当前 chat 历史线程累计 tokens
-- 当前仓库累计 tokens
-- 最近 5 小时活跃线程累计 tokens
-- 本机全部线程累计 tokens
-
-OpenAI 官方文档说明了 Codex 的套餐限额和窗口，但当前没有对 ChatGPT 套餐开放精确“剩余额度”查询接口。
 
 ## 安全边界
 
