@@ -39,8 +39,9 @@ from telegram.ext import (
 LOCK_PATH = Path(__file__).with_name("bot.lock")
 MUTEX_NAME = "Local\\TelegramCodexBridgeBot"
 _mutex_handle: int | None = None
-VALID_VERBOSE_LEVELS = ("off", "new", "all", "verbose")
+VALID_VERBOSE_LEVELS = ("off", "thinking", "new", "all", "verbose")
 THREAD_CALLBACK_PREFIX = "thread"
+STREAM_BUFFER_THRESHOLD = 40
 
 
 def parse_int_set(raw: str) -> set[int]:
@@ -486,35 +487,127 @@ def render_progress_bar(percent: int, width: int = 10) -> str:
     return "[" + "#" * filled + "-" * (width - filled) + "]"
 
 
-def render_live_status(turn: ActiveTurn, max_chars: int, verbose: str) -> str:
-    if verbose == "off":
-        return "思考中…"
+def format_elapsed(seconds: float) -> str:
+    total = int(max(0, seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, seconds = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
 
-    percent = stage_progress(turn.stage)
-    lines = [
-        f"状态: {turn.stage}",
-        f"{render_progress_bar(percent)} {percent}%",
-        f"repo: {turn.repo_key}",
-        f"thread: {turn.thread_id}",
-        f"运行: {int(max(0, time.time() - turn.started_at))}s",
-    ]
-    idle_seconds = int(max(0, time.time() - turn.last_event_at))
-    if idle_seconds >= 4 and verbose in {"new", "all", "verbose"}:
-        lines.append(f"等待下一段输出: {idle_seconds}s")
-    if turn.running_command and verbose in {"new", "all", "verbose"}:
-        lines.extend(["", "当前命令", shorten_middle(turn.running_command, 180)])
-    if turn.recent_commands and verbose in {"all", "verbose"}:
-        lines.extend(["", "最近命令"])
-        lines.extend(f"- {shorten_middle(command, 120)}" for command in turn.recent_commands[-3:])
-    if turn.modified_files and verbose in {"new", "all", "verbose"}:
-        lines.extend(["", "修改文件"])
-        lines.extend(f"- {path}" for path in turn.modified_files[-5:])
-    if turn.tool_notes and verbose == "verbose":
-        lines.extend(["", "进度"])
-        lines.extend(f"- {note}" for note in turn.tool_notes[-4:])
-    if turn.text.strip() and verbose in {"all", "verbose"}:
-        lines.extend(["", "输出预览", trim_for_stream(turn.text, 1200)])
-    return trim_for_stream("\n".join(lines), max_chars)
+
+def render_run_status(
+    turn: ActiveTurn,
+    verbose: str,
+    *,
+    state: str = "running",
+) -> str:
+    if verbose == "off":
+        return ""
+
+    elapsed = format_elapsed(time.time() - turn.started_at)
+    if state == "running":
+        lines = ["思考中…", f"已运行 {elapsed}"]
+    elif state == "done":
+        lines = ["已完成", f"总用时 {elapsed}"]
+    elif state == "error":
+        lines = ["执行失败", f"总用时 {elapsed}"]
+    else:
+        lines = ["已中断", f"总用时 {elapsed}"]
+
+    if state == "running" and verbose in {"all", "verbose"}:
+        lines.append(f"阶段: {turn.stage}")
+        idle_seconds = int(max(0, time.time() - turn.last_event_at))
+        if idle_seconds >= 4:
+            lines.append(f"等待下一段输出: {idle_seconds}s")
+    if state == "running" and turn.running_command and verbose == "verbose":
+        lines.extend(["", "当前命令", shorten_middle(turn.running_command, 240)])
+    return trim_for_stream("\n".join(lines), 600)
+
+
+def format_tool_event(event: dict[str, Any], verbose: str) -> str | None:
+    if verbose == "off":
+        return None
+
+    kind = str(event.get("kind") or "")
+    if kind == "shell":
+        command = str(event.get("command") or "").strip()
+        if not command:
+            return None
+        return "\n".join(
+            [
+                "已运行命令",
+                shorten_middle(command, 500 if verbose in {"all", "verbose"} else 220),
+            ]
+        )
+
+    if kind == "shell_done":
+        if verbose not in {"all", "verbose"}:
+            return None
+        command = str(event.get("command") or "").strip()
+        if not command:
+            return "命令已完成"
+        return "\n".join(
+            [
+                "命令已完成",
+                shorten_middle(command, 400),
+            ]
+        )
+
+    if kind == "read":
+        if verbose not in {"all", "verbose"}:
+            return None
+        name = str(event.get("name") or "read_context")
+        return f"已读取上下文\n{name}"
+
+    if kind == "patch":
+        if verbose != "verbose":
+            return None
+        return "开始应用补丁"
+
+    if kind == "patch_output":
+        files = [str(item) for item in event.get("files") or [] if str(item).strip()]
+        if not files:
+            return None
+        limit = 5 if verbose in {"thinking", "new"} else 10
+        lines = ["已修改文件"]
+        lines.extend(f"- {path}" for path in files[:limit])
+        if len(files) > limit:
+            lines.append(f"- 还有 {len(files) - limit} 个文件")
+        return "\n".join(lines)
+
+    return None
+
+
+async def sync_text_bubbles(
+    application: Application,
+    chat_id: int,
+    message_ids: list[int],
+    previous_chunks: list[str],
+    text: str,
+    limit: int,
+) -> tuple[list[int], list[str]]:
+    chunks = split_message(text, limit)
+    if not chunks:
+        return message_ids, previous_chunks
+
+    current_ids = list(message_ids)
+    for index, chunk in enumerate(chunks):
+        if index < len(current_ids):
+            if index < len(previous_chunks) and previous_chunks[index] == chunk:
+                continue
+            current_ids[index] = await update_stream_message(
+                application,
+                chat_id,
+                current_ids[index],
+                chunk,
+            )
+            continue
+        message = await application.bot.send_message(chat_id=chat_id, text=chunk)
+        current_ids.append(message.message_id)
+    return current_ids, chunks
 
 
 class CodexAppServerClient:
@@ -625,6 +718,44 @@ class CodexAppServerClient:
         for future in pending:
             if not future.done():
                 future.set_exception(RuntimeError("Codex app-server 已断开"))
+
+    async def shutdown(self) -> None:
+        process = self.process
+        stdout_task = self.stdout_task
+        stderr_task = self.stderr_task
+
+        self.process = None
+        self.stdout_task = None
+        self.stderr_task = None
+        self.loaded_threads.clear()
+
+        if process and process.stdin:
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+
+        if process and process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+            except ProcessLookupError:
+                pass
+
+        for task in (stdout_task, stderr_task):
+            if not task:
+                continue
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
 
     async def request(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
         await self.ensure_started()
@@ -901,21 +1032,27 @@ class ConversationManager:
                     turn.running_command = command
                     append_unique(turn.recent_commands, command, limit=10)
                     append_unique(turn.tool_notes, "已开始执行命令", limit=6)
+                    await turn.push({"type": "tool", "kind": "shell", "command": command})
                     await turn.push({"type": "status"})
                 return
 
             if name in {"read_mcp_resource", "read_thread_terminal"}:
                 turn.stage = "读取上下文"
                 append_unique(turn.tool_notes, f"读取 {name}", limit=6)
+                await turn.push({"type": "tool", "kind": "read", "name": name})
                 await turn.push({"type": "status"})
                 return
 
         if item_type == "function_call_output":
             if turn.running_command:
+                completed_command = turn.running_command
                 append_unique(turn.tool_notes, "命令执行完成", limit=6)
                 turn.running_command = None
                 if turn.stage == "执行命令":
                     turn.stage = "整理结果"
+                await turn.push(
+                    {"type": "tool", "kind": "shell_done", "command": completed_command}
+                )
                 await turn.push({"type": "status"})
             return
 
@@ -924,17 +1061,22 @@ class ConversationManager:
             if name == "apply_patch":
                 turn.stage = "修改文件"
                 append_unique(turn.tool_notes, "正在应用补丁", limit=6)
+                await turn.push({"type": "tool", "kind": "patch"})
                 await turn.push({"type": "status"})
             return
 
         if item_type == "custom_tool_call_output":
             output = item.get("output") or ""
             if isinstance(output, str):
-                for path in extract_updated_files(output):
+                changed_files = extract_updated_files(output)
+                for path in changed_files:
                     append_unique(turn.modified_files, path, limit=12)
-                if extract_updated_files(output):
+                if changed_files:
                     turn.stage = "修改文件"
                     append_unique(turn.tool_notes, "补丁已写入", limit=6)
+                    await turn.push(
+                        {"type": "tool", "kind": "patch_output", "files": changed_files}
+                    )
                     await turn.push({"type": "status"})
             return
 
@@ -1288,7 +1430,7 @@ def build_usage_text(
     snapshot = load_usage_snapshot(settings, store, chat_id)
     lines = [
         "用量",
-        "官方剩余额度: 当前没有对 ChatGPT 套餐开放精确查询接口",
+        "官方剩余额度: 本机 CLI 和 state_5.sqlite 没有公开剩余额度字段",
         "当前显示的是本机 Codex 的本地估算用量",
         "",
         f"当前线程累计 tokens: {format_number(snapshot.current_thread_tokens)}",
@@ -1308,7 +1450,7 @@ def build_usage_text(
 
 
 def get_chat_verbose(store: SessionStore, chat_id: int) -> str:
-    return store.get_verbose_level(chat_id) or "new"
+    return store.get_verbose_level(chat_id) or "thinking"
 
 
 def describe_access_mode(settings: Settings, sandbox: str) -> str:
@@ -2007,12 +2149,16 @@ async def update_stream_message(
 async def stream_turn_to_telegram(
     application: Application,
     turn: ActiveTurn,
-    message_id: int,
+    message_id: int | None,
     settings: Settings,
 ) -> None:
-    last_edit_at = 0.0
-    last_text = "思考中…"
-    current_message_id = message_id
+    last_status_edit_at = 0.0
+    last_status_text = ""
+    last_answer_flush_at = 0.0
+    last_answer_length = 0
+    status_message_id = message_id
+    answer_message_ids: list[int] = []
+    answer_chunks: list[str] = []
     store: SessionStore = application.bot_data["store"]
     conversations: ConversationManager = application.bot_data["conversations"]
     verbose = get_chat_verbose(store, turn.chat_id)
@@ -2024,85 +2170,135 @@ async def stream_turn_to_telegram(
             except asyncio.TimeoutError:
                 if conversations.get_active(turn.chat_id) is not turn:
                     return
-                now = time.time()
-                text = render_live_status(turn, settings.max_message_chars, verbose)
-                if now - last_edit_at < settings.stream_edit_interval or text == last_text:
+                if not status_message_id or verbose == "off":
                     continue
-                current_message_id = await update_stream_message(
+                now = time.time()
+                text = render_run_status(turn, verbose, state="running")
+                if now - last_status_edit_at < settings.stream_edit_interval or text == last_status_text:
+                    continue
+                status_message_id = await update_stream_message(
                     application,
                     turn.chat_id,
-                    current_message_id,
+                    status_message_id,
                     text,
                 )
-                last_edit_at = now
-                last_text = text
+                last_status_edit_at = now
+                last_status_text = text
                 continue
             event_type = event["type"]
-            if event_type in {"delta", "status"}:
-                now = time.time()
-                text = render_live_status(turn, settings.max_message_chars, verbose)
-                if now - last_edit_at < settings.stream_edit_interval or text == last_text:
+
+            if event_type == "tool":
+                tool_text = format_tool_event(event, verbose)
+                if tool_text:
+                    for chunk in split_message(tool_text, settings.max_message_chars):
+                        await application.bot.send_message(chat_id=turn.chat_id, text=chunk)
+                continue
+
+            if event_type == "status":
+                if not status_message_id or verbose == "off":
                     continue
-                current_message_id = await update_stream_message(
+                now = time.time()
+                text = render_run_status(turn, verbose, state="running")
+                if now - last_status_edit_at < settings.stream_edit_interval or text == last_status_text:
+                    continue
+                status_message_id = await update_stream_message(
                     application,
                     turn.chat_id,
-                    current_message_id,
+                    status_message_id,
                     text,
                 )
-                last_edit_at = now
-                last_text = text
+                last_status_edit_at = now
+                last_status_text = text
+                continue
+
+            if event_type == "delta":
+                if status_message_id and verbose != "off":
+                    now = time.time()
+                    text = render_run_status(turn, verbose, state="running")
+                    if now - last_status_edit_at >= settings.stream_edit_interval and text != last_status_text:
+                        status_message_id = await update_stream_message(
+                            application,
+                            turn.chat_id,
+                            status_message_id,
+                            text,
+                        )
+                        last_status_edit_at = now
+                        last_status_text = text
+
+                now = time.time()
+                should_flush = (
+                    not answer_message_ids
+                    or len(turn.text) - last_answer_length >= STREAM_BUFFER_THRESHOLD
+                    or now - last_answer_flush_at >= max(1.2, settings.stream_edit_interval * 2)
+                )
+                if not should_flush:
+                    continue
+                answer_message_ids, answer_chunks = await sync_text_bubbles(
+                    application,
+                    turn.chat_id,
+                    answer_message_ids,
+                    answer_chunks,
+                    turn.text,
+                    settings.max_message_chars,
+                )
+                last_answer_flush_at = now
+                last_answer_length = len(turn.text)
                 continue
 
             if event_type == "done":
                 final_text = event["text"].strip() or "已完成。"
-                footer_lines: list[str] = []
-                if turn.recent_commands and verbose in {"new", "all", "verbose"}:
-                    footer_lines.extend(["", "执行命令"])
-                    footer_lines.extend(
-                        f"- {shorten_middle(command, 120)}"
-                        for command in turn.recent_commands[-5:]
-                    )
-                if turn.modified_files and verbose in {"new", "all", "verbose"}:
-                    footer_lines.extend(["", "修改文件"])
-                    footer_lines.extend(f"- {path}" for path in turn.modified_files[-8:])
-                if footer_lines:
-                    final_text = final_text.rstrip() + "\n" + "\n".join(footer_lines)
-                chunks = split_message(final_text, settings.max_message_chars)
-                if chunks:
-                    current_message_id = await update_stream_message(
-                        application,
-                        turn.chat_id,
-                        current_message_id,
-                        chunks[0],
-                    )
-                    for chunk in chunks[1:]:
+                answer_message_ids, answer_chunks = await sync_text_bubbles(
+                    application,
+                    turn.chat_id,
+                    answer_message_ids,
+                    answer_chunks,
+                    final_text,
+                    settings.max_message_chars,
+                )
+                if status_message_id and verbose != "off":
+                    done_text = render_run_status(turn, verbose, state="done")
+                    if done_text:
+                        await update_stream_message(
+                            application,
+                            turn.chat_id,
+                            status_message_id,
+                            done_text,
+                        )
+                if not answer_message_ids:
+                    for chunk in split_message(final_text, settings.max_message_chars):
                         await application.bot.send_message(chat_id=turn.chat_id, text=chunk)
                 return
 
             if event_type == "error":
-                text = f"执行失败\n\n{event['text']}"
-                await update_stream_message(
-                    application,
-                    turn.chat_id,
-                    current_message_id,
-                    trim_for_stream(text, settings.max_message_chars),
-                )
+                error_text = trim_for_stream(f"执行失败\n\n{event['text']}", settings.max_message_chars)
+                if status_message_id and verbose != "off":
+                    fail_text = render_run_status(turn, verbose, state="error")
+                    if fail_text:
+                        await update_stream_message(
+                            application,
+                            turn.chat_id,
+                            status_message_id,
+                            fail_text,
+                        )
+                await application.bot.send_message(chat_id=turn.chat_id, text=error_text)
                 return
 
             if event_type == "interrupted":
-                await update_stream_message(
-                    application,
-                    turn.chat_id,
-                    current_message_id,
-                    event["text"],
-                )
+                if status_message_id and verbose != "off":
+                    stop_text = render_run_status(turn, verbose, state="interrupted")
+                    if stop_text:
+                        await update_stream_message(
+                            application,
+                            turn.chat_id,
+                            status_message_id,
+                            stop_text,
+                        )
+                await application.bot.send_message(chat_id=turn.chat_id, text=event["text"])
                 return
     except Exception as exc:
-        await update_stream_message(
-            application,
-            turn.chat_id,
-            current_message_id,
-            f"桥接失败\n\n{type(exc).__name__}: {exc}",
+        await application.bot.send_message(
+            chat_id=turn.chat_id,
+            text=f"桥接失败\n\n{type(exc).__name__}: {exc}",
         )
 
 
@@ -2152,7 +2348,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "/summary [序号或 thread_id] 压缩线程上下文 / Summarize thread",
             "/archive 归档当前线程 / Archive current thread",
             "/cleanup_threads 批量归档这个 chat 的旧线程 / Cleanup old threads",
-            "/verbose [off|new|all|verbose] 设置工具进度显示 / Verbose mode",
+            "/verbose [off|thinking|new|all|verbose] 设置消息显示档位 / Display mode",
             "/access [default|full] 切换访问权限 / Access mode",
             "/model [模型名] 查看或切换模型 / Model",
             "/effort [minimal|low|medium|high|xhigh] 查看或切换思考强度 / Effort",
@@ -2538,11 +2734,12 @@ async def verbose_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "\n".join(
                 [
                     f"当前进度显示: {current}",
-                    "用法: /verbose <off|new|all|verbose>",
+                    "用法: /verbose <off|thinking|new|all|verbose>",
                     "off = 只看最终答案",
-                    "new = 当前命令和修改文件",
-                    "all = 再加输出预览",
-                    "verbose = 完整工具进度",
+                    "thinking = thinking 气泡 + 回答气泡",
+                    "new = 再加命令和改文件气泡",
+                    "all = 再加上下文工具气泡",
+                    "verbose = 最细工具进度",
                 ]
             )
         )
@@ -2551,7 +2748,7 @@ async def verbose_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     raw = context.args[0].strip().lower()
     if raw not in VALID_VERBOSE_LEVELS:
         await update.effective_message.reply_text(
-            "显示档位无效。\n可用值: off, new, all, verbose"
+            "显示档位无效。\n可用值: off, thinking, new, all, verbose"
         )
         return
     store.set_verbose_level(chat_id, raw)
@@ -3010,12 +3207,15 @@ async def dispatch_chat_message(
         await update.effective_message.reply_text(f"启动失败\n{type(exc).__name__}: {exc}")
         return
 
-    placeholder = await update.effective_message.reply_text("思考中…")
+    placeholder_id: int | None = None
+    if get_chat_verbose(store, chat_id) != "off":
+        placeholder = await update.effective_message.reply_text("思考中…")
+        placeholder_id = placeholder.message_id
     asyncio.create_task(
         stream_turn_to_telegram(
             context.application,
             turn,
-            placeholder.message_id,
+            placeholder_id,
             settings,
         )
     )

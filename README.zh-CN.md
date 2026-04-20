@@ -9,7 +9,7 @@
 ## 功能
 
 - 一个 chat 对应一个持久 `thread_id`
-- 流式状态消息，能显示阶段、命令、修改文件
+- `thinking` 状态气泡，加上独立的工具气泡和回答气泡
 - 历史线程、切回、归档、全文导出、摘要压缩
 - 按 chat 保存模型、思考强度、访问权限、显示档位
 - 支持图片和文件附件
@@ -31,7 +31,7 @@
 - `/summary [序号|thread_id]` 压缩摘要
 - `/archive` 归档当前线程
 - `/cleanup_threads` 清理旧线程
-- `/verbose [off|new|all|verbose]` 进度显示档位
+- `/verbose [off|thinking|new|all|verbose]` 显示档位
 - `/access [default|full]` 访问权限
 - `/model [name]` 模型设置
 - `/effort [minimal|low|medium|high|xhigh]` 思考强度
@@ -95,17 +95,6 @@ OpenAI 官方文档说明了 Codex 的套餐限额和窗口，但当前没有对
 - `danger-full-access` 视为完全本地执行
 - token 泄露后立即轮换
 - 不要把本地会话、授权态、日志、`.env` 提交到 Git
-
-## 开源前必须排除
-
-- `.env`
-- `state/`
-- `*.log`
-- `bot.lock`
-- `~/.codex/auth.json`
-- `~/.codex/sessions`
-- `~/.codex/archived_sessions`
-- 任何聊天记录、截图、导出文件、凭据
 
 ## 许可证
 

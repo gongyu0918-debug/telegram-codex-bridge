@@ -9,7 +9,7 @@ This project is an unofficial community bridge. It uses the Telegram Bot API plu
 ## Features
 
 - Persistent chat-to-thread mapping
-- Streaming message edits with status, command, and file-change previews
+- Thinking-style status bubble plus separate tool and answer bubbles
 - Thread history, resume, archive, full transcript export, and summary
 - Per-chat model, reasoning effort, access mode, and verbosity settings
 - Attachment intake for images and documents
@@ -31,7 +31,7 @@ This project is an unofficial community bridge. It uses the Telegram Bot API plu
 - `/summary [index|thread_id]` compress thread context
 - `/archive` archive current thread
 - `/cleanup_threads` archive old threads from this chat
-- `/verbose [off|new|all|verbose]` progress display mode
+- `/verbose [off|thinking|new|all|verbose]` display mode
 - `/access [default|full]` sandbox mode
 - `/model [name]` set or inspect model
 - `/effort [minimal|low|medium|high|xhigh]` set or inspect reasoning effort
@@ -95,19 +95,6 @@ This bridge exposes your local Codex workflow to Telegram. Keep these boundaries
 - treat `danger-full-access` as full local execution
 - rotate leaked bot tokens immediately
 - never commit local session files, auth state, logs, or `.env`
-
-## Open source safety
-
-Files that must stay out of Git:
-
-- `.env`
-- `state/`
-- `*.log`
-- `bot.lock`
-- `~/.codex/auth.json`
-- `~/.codex/sessions`
-- `~/.codex/archived_sessions`
-- any exported chat history, screenshots, or credentials
 
 ## License
 
