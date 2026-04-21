@@ -60,7 +60,7 @@ TELEGRAM_BOT_TOKEN=123456:replace_me
 ALLOWED_CHAT_IDS=
 REPOS=default=.
 STATE_DIR=./state
-CODEX_COMMAND=cmd /c npx @openai/codex@latest
+CODEX_COMMAND=cmd /c npx @openai/codex@0.122.0
 CODEX_APPROVAL=never
 CODEX_SANDBOX=danger-full-access
 CODEX_DEFAULT_SANDBOX=workspace-write
@@ -81,6 +81,14 @@ AUTO_ARCHIVE_ON_NEW=true
 - `danger-full-access` 视为完全本地执行
 - token 泄露后立即轮换
 - 不要把本地会话、授权态、日志、`.env` 提交到 Git
+
+## 版本建议
+
+`CODEX_COMMAND` 最好固定到已经验证过的 Codex CLI 版本。
+
+- 推荐：`cmd /c npx @openai/codex@0.122.0`
+- `@latest` 适合本机追新版
+- 固定版本可以减少桥接层和 Codex 协议一起漂移时的静默兼容问题
 
 ## 许可证
 

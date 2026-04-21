@@ -60,7 +60,7 @@ TELEGRAM_BOT_TOKEN=123456:replace_me
 ALLOWED_CHAT_IDS=
 REPOS=default=.
 STATE_DIR=./state
-CODEX_COMMAND=cmd /c npx @openai/codex@latest
+CODEX_COMMAND=cmd /c npx @openai/codex@0.122.0
 CODEX_APPROVAL=never
 CODEX_SANDBOX=danger-full-access
 CODEX_DEFAULT_SANDBOX=workspace-write
@@ -81,6 +81,14 @@ This bridge exposes your local Codex workflow to Telegram. Keep these boundaries
 - treat `danger-full-access` as full local execution
 - rotate leaked bot tokens immediately
 - never commit local session files, auth state, logs, or `.env`
+
+## Versioning
+
+Pin `CODEX_COMMAND` to a tested Codex CLI version for stability.
+
+- Recommended: `cmd /c npx @openai/codex@0.122.0`
+- `@latest` is convenient for local experiments
+- fixed versions reduce silent protocol drift between bridge releases and Codex updates
 
 ## License
 

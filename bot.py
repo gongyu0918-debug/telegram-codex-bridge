@@ -646,6 +646,15 @@ class CodexAppServerClient:
                 },
             },
         )
+        await self.notify("initialized")
+
+    async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        assert self.process and self.process.stdin
+        payload: dict[str, Any] = {"method": method}
+        if params:
+            payload["params"] = params
+        self.process.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+        await self.process.stdin.drain()
 
     async def _stdout_loop(self) -> None:
         assert self.process and self.process.stdout
