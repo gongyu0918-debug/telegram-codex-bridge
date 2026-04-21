@@ -15,7 +15,10 @@
 - 历史线程、切回、归档、全文导出、摘要压缩
 - 按 chat 保存模型、思考强度、访问权限、显示档位
 - 支持图片和文件附件
+- dynamic tool 回调支持图文 content items
 - `/health` 可查看 Telegram 轮询、Codex app-server 和编辑队列状态
+- 网络断线恢复后会补一条重连通知
+- 本地线程索引带持久化缓存，`/threads`、`/history`、`/summary` 更快
 - slash 菜单和内联按钮采用中英双语
 
 ## 命令
@@ -34,7 +37,7 @@
 - `/archive` 归档当前线程
 - `/cleanup_threads` 清理旧线程
 - `/verbose [off|thinking|new|all|verbose]` 显示档位
-- `/access [default|full]` 访问权限
+- `/access [default|full]` 访问权限，`full` 需要确认
 - `/model [name]` 模型设置
 - `/effort [minimal|low|medium|high|xhigh]` 思考强度
 - `/stop` 中断当前回复
@@ -44,7 +47,7 @@
 ## 快速开始
 
 ```powershell
-cd telegram_codex_bridge
+cd telegram-codex-bridge
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
@@ -62,12 +65,14 @@ python bot.py
 ```env
 TELEGRAM_BOT_TOKEN=123456:replace_me
 ALLOWED_CHAT_IDS=
+ALLOW_ALL_CHATS=false
 REPOS=default=.
 STATE_DIR=./state
 CODEX_COMMAND=cmd /c npx @openai/codex@0.122.0
-CODEX_APPROVAL=never
-CODEX_SANDBOX=danger-full-access
+CODEX_APPROVAL=on-request
+CODEX_SANDBOX=workspace-write
 CODEX_DEFAULT_SANDBOX=workspace-write
+FULL_ACCESS_TTL_SECONDS=1800
 CODEX_MODEL=gpt-5.4
 CODEX_REASONING_EFFORT=medium
 MAX_PROMPT_CHARS=12000
@@ -93,6 +98,8 @@ AUTO_ARCHIVE_ON_NEW=true
 - 推荐：`cmd /c npx @openai/codex@0.122.0`
 - `@latest` 适合本机追新版
 - 固定版本可以减少桥接层和 Codex 协议一起漂移时的静默兼容问题
+
+本机私有环境依然可以在未跟踪的 `.env` 里保留 `danger-full-access`。公开模板保持更稳的默认值。
 
 ## 协议快照和 CI
 

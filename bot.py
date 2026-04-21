@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import base64
 import ctypes
 import glob
 import json
@@ -10,6 +11,7 @@ import os
 import re
 import shlex
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +47,17 @@ SUMMARY_MODEL_TIMEOUT_SECONDS = 20
 EDIT_QUEUE_DEBOUNCE_SECONDS = 0.18
 TASK_CARD_COMMAND_LIMIT = 4
 TASK_CARD_FILE_LIMIT = 6
+FULL_ACCESS_CONFIRM_WINDOW_SECONDS = 90
+APPROVAL_CALLBACK_PREFIX = "approval"
+APPROVAL_TIMEOUT_SECONDS = 900
+STRUCTURED_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+LOCAL_THREAD_INDEX_CACHE_VERSION = 2
+LOCAL_THREAD_INDEX_CACHE_PATH = Path.home() / ".codex" / "thread_index_cache.json"
+LOCAL_THREAD_INDEX_WARM_TTL_SECONDS = 15
+DYNAMIC_TOOL_IMAGE_LIMIT = 4
+POLLING_PROBE_TYPES: set[type] = set()
+POLLING_PROBE_APPLICATIONS: dict[int, Application] = {}
 
 
 def parse_int_set(raw: str) -> set[int]:
@@ -102,12 +115,47 @@ def split_message(text: str, limit: int = 3800) -> list[str]:
         if len(text) <= limit:
             chunks.append(text)
             break
-        split_at = text.rfind("\n", 0, limit)
-        if split_at <= 0:
-            split_at = limit
-        chunks.append(text[:split_at].rstrip())
-        text = text[split_at:].lstrip()
+        split_at = choose_split_point(text, limit)
+        chunk = text[:split_at].rstrip()
+        remainder = text[split_at:].lstrip()
+        if chunk.count("```") % 2 == 1:
+            fence_header = find_last_fence_header(chunk)
+            if fence_header:
+                chunk = chunk.rstrip() + "\n```"
+                remainder = fence_header + "\n" + remainder.lstrip()
+        chunks.append(chunk)
+        text = remainder
     return chunks
+
+
+def choose_split_point(text: str, limit: int) -> int:
+    preferred_patterns = [
+        "\n```",
+        "\n@@ ",
+        "\ndiff --git",
+        "\n\n",
+        "\n",
+        " ",
+    ]
+    for pattern in preferred_patterns:
+        index = text.rfind(pattern, 0, limit)
+        if index > max(200, limit // 3):
+            split_at = index + (1 if pattern == " " else 0)
+            chunk = text[:split_at]
+            if chunk.count("```") % 2 == 1:
+                earlier_fence = chunk.rfind("\n```", 0, split_at - 1)
+                if earlier_fence > max(200, limit // 3):
+                    return earlier_fence
+            return split_at
+    return limit
+
+
+def find_last_fence_header(text: str) -> str | None:
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            return stripped
+    return None
 
 
 def process_exists(pid: int) -> bool:
@@ -188,12 +236,14 @@ def trim_for_stream(text: str, limit: int = 3800) -> str:
 class Settings:
     telegram_bot_token: str
     allowed_chat_ids: set[int]
+    allow_all_chats: bool
     repos: dict[str, Path]
     state_dir: Path
     codex_command: list[str]
     codex_approval: str
     codex_sandbox: str
     codex_default_sandbox: str
+    full_access_ttl_seconds: int
     codex_model: str | None
     codex_reasoning_effort: str | None
     max_prompt_chars: int
@@ -214,19 +264,30 @@ class Settings:
         state_dir.mkdir(parents=True, exist_ok=True)
 
         chat_ids_raw = os.getenv("ALLOWED_CHAT_IDS", "").strip()
+        allow_all_chats = os.getenv("ALLOW_ALL_CHATS", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        allowed_chat_ids = parse_int_set(chat_ids_raw) if chat_ids_raw else set()
+        if not allowed_chat_ids and not allow_all_chats:
+            raise ValueError("缺少 ALLOWED_CHAT_IDS。要显式开放启动，请设置 ALLOW_ALL_CHATS=true。")
         return cls(
             telegram_bot_token=token,
-            allowed_chat_ids=parse_int_set(chat_ids_raw) if chat_ids_raw else set(),
+            allowed_chat_ids=allowed_chat_ids,
+            allow_all_chats=allow_all_chats,
             repos=parse_repo_map(repos_raw) if repos_raw else default_repo_map(),
             state_dir=state_dir,
             codex_command=parse_command(
-                os.getenv("CODEX_COMMAND", "npx @openai/codex@latest")
+                os.getenv("CODEX_COMMAND", "cmd /c npx @openai/codex@0.122.0")
             ),
-            codex_approval=os.getenv("CODEX_APPROVAL", "never").strip() or "never",
-            codex_sandbox=os.getenv("CODEX_SANDBOX", "danger-full-access").strip()
-            or "danger-full-access",
+            codex_approval=os.getenv("CODEX_APPROVAL", "on-request").strip() or "on-request",
+            codex_sandbox=os.getenv("CODEX_SANDBOX", "workspace-write").strip()
+            or "workspace-write",
             codex_default_sandbox=os.getenv("CODEX_DEFAULT_SANDBOX", "workspace-write").strip()
             or "workspace-write",
+            full_access_ttl_seconds=max(0, int(os.getenv("FULL_ACCESS_TTL_SECONDS", "1800"))),
             codex_model=os.getenv("CODEX_MODEL", "gpt-5.4").strip() or "gpt-5.4",
             codex_reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "medium").strip()
             or "medium",
@@ -241,7 +302,7 @@ class Settings:
 class SessionStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.data: dict[str, dict[str, Any]] = {"chat_prefs": {}}
+        self.data: dict[str, Any] = {"chat_prefs": {}, "pending_requests": {}}
         if self.path.exists():
             self.data = json.loads(self.path.read_text(encoding="utf-8"))
         self._migrate()
@@ -249,6 +310,10 @@ class SessionStore:
     def _migrate(self) -> None:
         changed = False
         prefs = self.data.setdefault("chat_prefs", {})
+        pending_requests = self.data.get("pending_requests")
+        if not isinstance(pending_requests, dict):
+            self.data["pending_requests"] = {}
+            changed = True
         for value in prefs.values():
             if not isinstance(value, dict):
                 continue
@@ -293,6 +358,7 @@ class SessionStore:
         chat = self._chat(chat_id)
         chat["repo_key"] = repo_key
         chat.pop("thread_id", None)
+        self.clear_runtime_snapshot(chat_id, save=False)
         self.save()
 
     def get_thread_id(self, chat_id: int) -> str | None:
@@ -348,6 +414,7 @@ class SessionStore:
         chat = self._chat(chat_id)
         if "thread_id" in chat:
             chat.pop("thread_id", None)
+            self.clear_runtime_snapshot(chat_id, save=False)
             self.save()
 
     def get_thread_history(self, chat_id: int) -> list[str]:
@@ -374,6 +441,132 @@ class SessionStore:
             chat.pop("verbose", None)
         self.save()
 
+    def get_full_access_expires_at(self, chat_id: int) -> float | None:
+        value = self._chat(chat_id).get("full_access_expires_at")
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    def set_full_access_expires_at(self, chat_id: int, expires_at: float | None) -> None:
+        chat = self._chat(chat_id)
+        if expires_at and expires_at > 0:
+            chat["full_access_expires_at"] = expires_at
+        else:
+            chat.pop("full_access_expires_at", None)
+        self.save()
+
+    def get_full_access_confirm_requested_at(self, chat_id: int) -> float | None:
+        value = self._chat(chat_id).get("full_access_confirm_requested_at")
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    def set_full_access_confirm_requested_at(self, chat_id: int, requested_at: float | None) -> None:
+        chat = self._chat(chat_id)
+        if requested_at and requested_at > 0:
+            chat["full_access_confirm_requested_at"] = requested_at
+        else:
+            chat.pop("full_access_confirm_requested_at", None)
+        self.save()
+
+    def find_chat_id_by_thread(self, thread_id: str) -> int | None:
+        prefs = self.data.get("chat_prefs", {})
+        for chat_id_str, value in prefs.items():
+            if not isinstance(value, dict):
+                continue
+            if value.get("thread_id") == thread_id:
+                return int(chat_id_str)
+            history = value.get("thread_history")
+            if isinstance(history, list) and thread_id in history:
+                return int(chat_id_str)
+        return None
+
+    def get_runtime_snapshot(self, chat_id: int) -> tuple[str | None, str | None, str | None]:
+        chat = self._chat(chat_id)
+        thread_id = chat.get("runtime_thread_id")
+        model = chat.get("runtime_model")
+        effort = chat.get("runtime_effort")
+        return (
+            thread_id if isinstance(thread_id, str) and thread_id else None,
+            model if isinstance(model, str) and model else None,
+            effort if isinstance(effort, str) and effort else None,
+        )
+
+    def set_runtime_snapshot(
+        self,
+        chat_id: int,
+        *,
+        thread_id: str,
+        model: str | None,
+        effort: str | None,
+    ) -> None:
+        chat = self._chat(chat_id)
+        chat["runtime_thread_id"] = thread_id
+        if model:
+            chat["runtime_model"] = model
+        else:
+            chat.pop("runtime_model", None)
+        if effort:
+            chat["runtime_effort"] = effort
+        else:
+            chat.pop("runtime_effort", None)
+        self.save()
+
+    def clear_runtime_snapshot(self, chat_id: int, *, save: bool = True) -> None:
+        chat = self._chat(chat_id)
+        changed = False
+        for key in ("runtime_thread_id", "runtime_model", "runtime_effort"):
+            if key in chat:
+                chat.pop(key, None)
+                changed = True
+        if changed and save:
+            self.save()
+
+    def list_pending_requests(self) -> list[dict[str, Any]]:
+        raw = self.data.get("pending_requests", {})
+        if not isinstance(raw, dict):
+            return []
+        items: list[dict[str, Any]] = []
+        for token, payload in raw.items():
+            if not isinstance(token, str) or not isinstance(payload, dict):
+                continue
+            item = dict(payload)
+            item["token"] = token
+            items.append(item)
+        return items
+
+    def get_pending_request(self, token: str) -> dict[str, Any] | None:
+        raw = self.data.get("pending_requests", {})
+        if not isinstance(raw, dict):
+            return None
+        payload = raw.get(token)
+        if not isinstance(payload, dict):
+            return None
+        item = dict(payload)
+        item["token"] = token
+        return item
+
+    def save_pending_request(self, record: dict[str, Any]) -> None:
+        token = str(record.get("token") or "").strip()
+        if not token:
+            raise ValueError("pending request token 不能为空")
+        pending_requests = self.data.setdefault("pending_requests", {})
+        if not isinstance(pending_requests, dict):
+            pending_requests = {}
+            self.data["pending_requests"] = pending_requests
+        payload = dict(record)
+        payload.pop("token", None)
+        pending_requests[token] = payload
+        self.save()
+
+    def delete_pending_request(self, token: str) -> None:
+        pending_requests = self.data.get("pending_requests", {})
+        if not isinstance(pending_requests, dict):
+            return
+        if token in pending_requests:
+            pending_requests.pop(token, None)
+            self.save()
+
 
 @dataclass
 class PollingHealth:
@@ -381,6 +574,10 @@ class PollingHealth:
     last_conflict_at: float | None = None
     last_error_text: str | None = None
     alerted_conflict: bool = False
+    last_disconnect_at: float | None = None
+    last_recovered_at: float | None = None
+    reconnect_notice_pending: bool = False
+    last_reconnect_notice_for: float | None = None
 
 
 @dataclass
@@ -627,6 +824,21 @@ def format_tool_event(event: dict[str, Any], verbose: str) -> str | None:
             return "已追加指令"
         return "\n".join(["已追加指令", shorten_middle(prompt, 280)])
 
+    if kind == "model_rerouted":
+        if verbose not in {"new", "all", "verbose"}:
+            return None
+        from_model = str(event.get("from_model") or "").strip()
+        to_model = str(event.get("to_model") or "").strip()
+        reason = str(event.get("reason") or "").strip()
+        lines = ["模型已切换"]
+        if from_model and to_model:
+            lines.append(f"{from_model} -> {to_model}")
+        elif to_model:
+            lines.append(to_model)
+        if reason:
+            lines.append(f"原因: {reason}")
+        return "\n".join(lines)
+
     if kind == "read":
         if verbose not in {"all", "verbose"}:
             return None
@@ -659,6 +871,38 @@ class PendingTelegramEdit:
     waiters: list[asyncio.Future[int]] = field(default_factory=list)
     dirty: bool = True
     worker: asyncio.Task[None] | None = None
+
+
+@dataclass
+class PendingApproval:
+    token: str
+    request_id: int | str
+    method: str
+    chat_id: int
+    thread_id: str
+    turn_id: str
+    item_id: str
+    prompt_text: str
+    result_future: asyncio.Future[dict[str, Any]] | None
+    requested_permissions: dict[str, Any] | None = None
+    user_input_questions: list[dict[str, Any]] = field(default_factory=list)
+    dynamic_tool_name: str | None = None
+    dynamic_tool_arguments: Any = None
+    message_id: int | None = None
+    created_at: float = field(default_factory=time.time)
+    stale: bool = False
+
+
+@dataclass
+class LocalThreadIndexState:
+    signature: tuple[Any, ...] | None = None
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    by_thread_id: dict[str, dict[str, Any]] = field(default_factory=dict)
+    last_loaded_at: float = 0.0
+    dirty: bool = False
+
+
+LOCAL_THREAD_INDEX = LocalThreadIndexState()
 
 
 class TelegramEditQueue:
@@ -782,13 +1026,14 @@ class CodexAppServerClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.process: asyncio.subprocess.Process | None = None
-        self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self.pending: dict[int | str, asyncio.Future[dict[str, Any]]] = {}
         self.request_lock = asyncio.Lock()
         self.lifecycle_lock = asyncio.Lock()
         self.request_id = 0
         self.stdout_task: asyncio.Task[None] | None = None
         self.stderr_task: asyncio.Task[None] | None = None
         self.notification_handlers: list[Any] = []
+        self.server_request_handlers: list[Any] = []
         self.loaded_threads: set[str] = set()
         self.err_log_path = self.settings.state_dir / "app_server.err.log"
         self.log = logging.getLogger("codex.appserver")
@@ -796,6 +1041,9 @@ class CodexAppServerClient:
 
     def add_notification_handler(self, handler: Any) -> None:
         self.notification_handlers.append(handler)
+
+    def add_server_request_handler(self, handler: Any) -> None:
+        self.server_request_handlers.append(handler)
 
     def request_timeout_for(self, method: str) -> float:
         if method in {"initialize", "thread/start", "thread/resume", "thread/read"}:
@@ -841,11 +1089,57 @@ class CodexAppServerClient:
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         assert self.process and self.process.stdin
-        payload: dict[str, Any] = {"method": method}
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params:
             payload["params"] = params
         self.process.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
         await self.process.stdin.drain()
+
+    async def _send_response(
+        self,
+        request_id: int | str,
+        *,
+        result: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        assert self.process and self.process.stdin
+        payload: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+        }
+        if error is not None:
+            payload["error"] = error
+        else:
+            payload["result"] = result or {}
+        self.process.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+        await self.process.stdin.drain()
+
+    async def _dispatch_server_request(self, payload: dict[str, Any]) -> None:
+        request_id = payload.get("id")
+        method = str(payload.get("method") or "")
+        try:
+            for handler in self.server_request_handlers:
+                result = await handler(payload)
+                if result is not None:
+                    await self._send_response(request_id, result=result)
+                    return
+            self.log.warning("未支持的 server request: %s", method)
+            await self._send_response(
+                request_id,
+                error={
+                    "code": -32601,
+                    "message": f"暂不支持的 server request: {method}",
+                },
+            )
+        except Exception as exc:
+            self.log.exception("处理 server request 失败: %s", method)
+            await self._send_response(
+                request_id,
+                error={
+                    "code": -32000,
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            )
 
     async def _stdout_loop(self) -> None:
         assert self.process and self.process.stdout
@@ -868,8 +1162,11 @@ class CodexAppServerClient:
                     except json.JSONDecodeError:
                         self.log.warning("忽略非 JSON stdout: %s", line[:500])
                         continue
+                    if "id" in payload and "method" in payload:
+                        asyncio.create_task(self._dispatch_server_request(payload))
+                        continue
                     if "id" in payload:
-                        future = self.pending.pop(int(payload["id"]), None)
+                        future = self.pending.pop(payload["id"], None)
                         if not future:
                             continue
                         if "error" in payload:
@@ -1018,23 +1315,34 @@ class CodexAppServerClient:
         self.loaded_threads.add(resumed_id)
         return resumed_id
 
-    async def start_turn(self, thread_id: str, prompt: str) -> str:
+    async def start_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> str:
         response = await self.request(
             "turn/start",
             {
                 "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt, "text_elements": []}],
+                "input": input_items or [{"type": "text", "text": prompt, "text_elements": []}],
             },
         )
         return response["turn"]["id"]
 
-    async def steer_turn(self, thread_id: str, turn_id: str, prompt: str) -> str:
+    async def steer_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        prompt: str,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> str:
         response = await self.request(
             "turn/steer",
             {
                 "threadId": thread_id,
                 "expectedTurnId": turn_id,
-                "input": [{"type": "text", "text": prompt, "text_elements": []}],
+                "input": input_items or [{"type": "text", "text": prompt, "text_elements": []}],
             },
         )
         return response["turnId"]
@@ -1090,6 +1398,26 @@ class CodexAppServerClient:
             },
         )
         return response.get("data", [])
+
+    async def list_models(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            response = await self.request(
+                "model/list",
+                {
+                    "cursor": cursor,
+                    "includeHidden": False,
+                    "limit": 100,
+                },
+            )
+            page = response.get("data") or []
+            if isinstance(page, list):
+                items.extend(item for item in page if isinstance(item, dict))
+            cursor = response.get("nextCursor")
+            if not cursor:
+                break
+        return items
 
     async def detect_version(self) -> str:
         if self.version_cache:
@@ -1150,23 +1478,27 @@ async def resolve_effective_runtime_info(
             store.get_reasoning_effort(chat_id) or settings.codex_reasoning_effort,
         )
 
+    cached_thread_id, cached_model, cached_effort = store.get_runtime_snapshot(chat_id)
+    if cached_thread_id == thread_id and (cached_model or cached_effort):
+        return (
+            cached_model or store.get_model(chat_id) or settings.codex_model,
+            cached_effort or store.get_reasoning_effort(chat_id) or settings.codex_reasoning_effort,
+        )
+
     repo_path = settings.repos[repo_key]
     local_threads = list_local_threads(repo_path, store.get_thread_history(chat_id), limit=200)
     thread = next((item for item in local_threads if item.get("id") == thread_id), None)
-    if not thread:
-        try:
-            thread_items = [
-                *await client.list_threads(cwd=repo_path, archived=False, limit=200),
-                *await client.list_threads(cwd=repo_path, archived=True, limit=200),
-            ]
-        except Exception:
-            thread_items = []
-        thread = next((item for item in thread_items if item.get("id") == thread_id), None)
     if thread:
         session_path = thread.get("path")
         if isinstance(session_path, str) and session_path:
             model, effort = extract_runtime_info_from_session_file(Path(session_path))
             if model or effort:
+                store.set_runtime_snapshot(
+                    chat_id,
+                    thread_id=thread_id,
+                    model=model,
+                    effort=effort,
+                )
                 return model, effort
 
     return (
@@ -1200,12 +1532,16 @@ class ConversationManager:
         if not thread_id:
             return False
         await self.client.archive_thread(thread_id)
+        invalidate_local_thread_index_cache()
         self.store.clear_thread_id(chat_id)
         return True
 
     async def _handle_notification(self, payload: dict[str, Any]) -> None:
         method = payload.get("method")
         params = payload.get("params", {})
+        if method == "model/rerouted":
+            await self._handle_model_rerouted(params)
+            return
         turn_id = params.get("turnId") or params.get("turn", {}).get("id")
         turn = self.active_by_turn.get(turn_id) if turn_id else None
         if not turn:
@@ -1244,6 +1580,44 @@ class ConversationManager:
             turn.error_text = message
             await turn.push({"type": "error", "text": message})
             self._finish_turn(turn)
+
+    async def _handle_model_rerouted(self, params: dict[str, Any]) -> None:
+        thread_id = str(params.get("threadId") or "").strip()
+        turn_id = str(params.get("turnId") or "").strip()
+        to_model = str(params.get("toModel") or "").strip()
+        from_model = str(params.get("fromModel") or "").strip()
+        reason = str(params.get("reason") or "").strip()
+        if not thread_id or not to_model:
+            return
+
+        active = self.active_by_turn.get(turn_id) if turn_id else None
+        chat_id = active.chat_id if active else self.store.find_chat_id_by_thread(thread_id)
+        if chat_id is None:
+            return
+
+        _, cached_model, cached_effort = self.store.get_runtime_snapshot(chat_id)
+        self.store.set_runtime_snapshot(
+            chat_id,
+            thread_id=thread_id,
+            model=to_model,
+            effort=cached_effort or self.store.get_reasoning_effort(chat_id) or self.settings.codex_reasoning_effort,
+        )
+        if not active:
+            return
+        note = f"模型已切换为 {to_model}"
+        if reason:
+            note = f"{note} ({reason})"
+        append_unique(active.tool_notes, note, limit=6)
+        await active.push(
+            {
+                "type": "tool",
+                "kind": "model_rerouted",
+                "from_model": from_model,
+                "to_model": to_model,
+                "reason": reason,
+            }
+        )
+        await active.push({"type": "status"})
 
     async def _handle_completed_item(self, turn: ActiveTurn, item: dict[str, Any]) -> None:
         item_type = item.get("type")
@@ -1311,7 +1685,12 @@ class ConversationManager:
         self.active_by_turn.pop(turn.turn_id, None)
         self.active_by_chat.pop(turn.chat_id, None)
 
-    async def steer_chat_turn(self, chat_id: int, prompt: str) -> ActiveTurn:
+    async def steer_chat_turn(
+        self,
+        chat_id: int,
+        prompt: str,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> ActiveTurn:
         active = self.get_active(chat_id)
         if not active:
             raise RuntimeError("当前没有运行中的回复。")
@@ -1319,6 +1698,7 @@ class ConversationManager:
             active.thread_id,
             active.turn_id,
             prompt,
+            input_items,
         )
         if next_turn_id != active.turn_id:
             self.active_by_turn.pop(active.turn_id, None)
@@ -1345,6 +1725,7 @@ class ConversationManager:
             if old_thread_id and self.settings.auto_archive_on_new:
                 try:
                     await self.client.archive_thread(old_thread_id)
+                    invalidate_local_thread_index_cache()
                 except Exception:
                     pass
             self.store.clear_thread_id(chat_id)
@@ -1361,12 +1742,15 @@ class ConversationManager:
                 # 旧版 sessions.json 里可能只有 thread_id 没有 history。
                 # 这里每次命中当前线程时都回填一次，保证 /threads 能看到。
                 self.store.set_thread_id(chat_id, thread_id)
+                cache_runtime_snapshot(self.store, self.settings, chat_id, thread_id, runtime_config)
                 return thread_id, repo_path
             except Exception:
                 self.store.clear_thread_id(chat_id)
 
         thread_id = await self.client.start_thread(repo_path, runtime_config)
+        invalidate_local_thread_index_cache()
         self.store.set_thread_id(chat_id, thread_id)
+        cache_runtime_snapshot(self.store, self.settings, chat_id, thread_id, runtime_config)
         return thread_id, repo_path
 
     async def switch_thread(
@@ -1382,6 +1766,7 @@ class ConversationManager:
         runtime_config = build_thread_runtime_config(self.settings, self.store, chat_id)
         try:
             await self.client.unarchive_thread(thread_id)
+            invalidate_local_thread_index_cache()
         except Exception:
             pass
         resumed_id = await self.client.resume_thread(
@@ -1390,6 +1775,7 @@ class ConversationManager:
             runtime_config,
         )
         self.store.set_thread_id(chat_id, resumed_id)
+        cache_runtime_snapshot(self.store, self.settings, chat_id, resumed_id, runtime_config)
         return resumed_id
 
     async def start_chat_turn(
@@ -1399,6 +1785,7 @@ class ConversationManager:
         prompt: str,
         *,
         force_new: bool = False,
+        input_items: list[dict[str, Any]] | None = None,
     ) -> ActiveTurn:
         active = self.get_active(chat_id)
         if active:
@@ -1409,7 +1796,7 @@ class ConversationManager:
             repo_key,
             force_new=force_new,
         )
-        turn_id = await self.client.start_turn(thread_id, prompt)
+        turn_id = await self.client.start_turn(thread_id, prompt, input_items)
         turn = ActiveTurn(
             chat_id=chat_id,
             repo_key=repo_key,
@@ -1438,7 +1825,7 @@ def ensure_authorized(update: Update, settings: Settings) -> bool:
     chat = update.effective_chat
     if not chat:
         return False
-    if not settings.allowed_chat_ids:
+    if settings.allow_all_chats and not settings.allowed_chat_ids:
         return True
     return chat.id in settings.allowed_chat_ids
 
@@ -1459,6 +1846,21 @@ def resolve_repo_key(
     return None
 
 
+def resolve_repo_key_for_thread(
+    settings: Settings,
+    store: SessionStore,
+    chat_id: int,
+    thread_id: str,
+) -> str | None:
+    cached = get_local_thread_index().by_thread_id.get(thread_id)
+    cached_cwd = str((cached or {}).get("cwd") or "").strip()
+    if cached_cwd:
+        for repo_key, repo_path in settings.repos.items():
+            if str(repo_path.resolve()) == cached_cwd:
+                return repo_key
+    return resolve_repo_key(chat_id, settings, store)
+
+
 def format_thread_preview(thread: dict[str, Any], fallback_id: str) -> str:
     preview = (thread.get("preview") or "").strip()
     if not preview:
@@ -1467,6 +1869,131 @@ def format_thread_preview(thread: dict[str, Any], fallback_id: str) -> str:
     if len(preview) > 40:
         preview = preview[:39] + "…"
     return preview
+
+
+def path_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def path_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def scan_directory_tree_signature(root: Path) -> tuple[int, float, str]:
+    if not root.exists():
+        return (0, 0.0, "")
+    count = 0
+    newest_mtime = 0.0
+    newest_path = ""
+    try:
+        for path in root.rglob("*"):
+            if not path.is_dir():
+                continue
+            count += 1
+            mtime = path_mtime(path)
+            path_str = str(path)
+            if mtime > newest_mtime or (mtime == newest_mtime and path_str > newest_path):
+                newest_mtime = mtime
+                newest_path = path_str
+    except OSError:
+        return (0, 0.0, "")
+    return (count, newest_mtime, newest_path)
+
+
+def read_local_thread_index_cache() -> dict[str, Any] | None:
+    if not LOCAL_THREAD_INDEX_CACHE_PATH.exists():
+        return None
+    try:
+        payload = json.loads(LOCAL_THREAD_INDEX_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version") != LOCAL_THREAD_INDEX_CACHE_VERSION:
+        return None
+    return payload
+
+
+def hydrate_local_thread_index_state(payload: dict[str, Any]) -> LocalThreadIndexState | None:
+    signature_raw = payload.get("signature")
+    entries_raw = payload.get("entries")
+    if not isinstance(signature_raw, list) or not isinstance(entries_raw, list):
+        return None
+    entries = [item for item in entries_raw if isinstance(item, dict)]
+    by_thread_id = {
+        str(item.get("id")): item
+        for item in entries
+        if isinstance(item.get("id"), str) and str(item.get("id")).strip()
+    }
+    return LocalThreadIndexState(
+        signature=tuple(signature_raw),
+        entries=entries,
+        by_thread_id=by_thread_id,
+        last_loaded_at=time.time(),
+        dirty=False,
+    )
+
+
+def save_local_thread_index_cache(state: LocalThreadIndexState) -> None:
+    LOCAL_THREAD_INDEX_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": LOCAL_THREAD_INDEX_CACHE_VERSION,
+        "saved_at": time.time(),
+        "signature": list(state.signature or ()),
+        "entries": state.entries,
+    }
+    tmp_path = LOCAL_THREAD_INDEX_CACHE_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(LOCAL_THREAD_INDEX_CACHE_PATH)
+
+
+def find_session_file_candidates(thread_id: str) -> list[Path]:
+    if not thread_id:
+        return []
+    codex_root = Path.home() / ".codex"
+    matches: list[Path] = []
+    seen: set[str] = set()
+    for base in ("sessions", "archived_sessions"):
+        pattern = codex_root / base / "**" / f"*-{thread_id}.jsonl"
+        for raw in glob.glob(str(pattern), recursive=True):
+            if raw in seen:
+                continue
+            seen.add(raw)
+            matches.append(Path(raw))
+    matches.sort(key=lambda item: path_mtime(item), reverse=True)
+    return matches
+
+
+def local_thread_index_signature() -> tuple[float, int, int, float, str, int, float, str]:
+    codex_root = Path.home() / ".codex"
+    sessions_count, sessions_mtime, sessions_path = scan_directory_tree_signature(codex_root / "sessions")
+    archived_count, archived_mtime, archived_path = scan_directory_tree_signature(
+        codex_root / "archived_sessions"
+    )
+    return (
+        path_mtime(codex_root / "session_index.jsonl"),
+        path_size(codex_root / "session_index.jsonl"),
+        sessions_count,
+        sessions_mtime,
+        sessions_path,
+        archived_count,
+        archived_mtime,
+        archived_path,
+    )
+
+
+def invalidate_local_thread_index_cache() -> None:
+    LOCAL_THREAD_INDEX.signature = None
+    LOCAL_THREAD_INDEX.entries = []
+    LOCAL_THREAD_INDEX.by_thread_id = {}
+    LOCAL_THREAD_INDEX.last_loaded_at = 0.0
+    LOCAL_THREAD_INDEX.dirty = True
 
 
 def load_session_index_map() -> dict[str, dict[str, str]]:
@@ -1518,43 +2045,151 @@ def extract_session_meta(path: Path) -> dict[str, Any] | None:
     return None
 
 
-def list_local_threads(repo_path: Path, history_ids: list[str], limit: int = 200) -> list[dict[str, Any]]:
-    codex_root = Path.home() / ".codex"
-    index_map = load_session_index_map()
-    files = [
-        *sorted((codex_root / "sessions").glob("**/*.jsonl"), reverse=True),
-        *sorted((codex_root / "archived_sessions").glob("*.jsonl"), reverse=True),
-    ]
-    items: list[dict[str, Any]] = []
+def build_local_thread_index_from_files(
+    files: list[Path],
+    index_map: dict[str, dict[str, str]],
+    signature: tuple[Any, ...],
+) -> LocalThreadIndexState:
+    entries: list[dict[str, Any]] = []
+    by_thread_id: dict[str, dict[str, Any]] = {}
     seen: set[str] = set()
-    repo_str = str(repo_path.resolve())
+
     for path in files:
         meta = extract_session_meta(path)
         if not meta:
             continue
         cwd = str(meta.get("cwd") or "").strip()
-        if cwd != repo_str:
-            continue
         thread_id = str(meta.get("id") or "").strip()
-        if not thread_id or thread_id in seen:
+        if not cwd or not thread_id or thread_id in seen:
             continue
         seen.add(thread_id)
         index_item = index_map.get(thread_id, {})
-        updated_at = index_item.get("updated_at") or datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+        updated_at = index_item.get("updated_at") or datetime.fromtimestamp(path_mtime(path)).isoformat()
         preview = index_item.get("name") or thread_id
         status = {"type": "archived"} if "archived_sessions" in str(path) else {}
-        items.append(
-            {
-                "id": thread_id,
-                "preview": preview,
-                "name": preview,
-                "path": str(path),
-                "updated_at": updated_at,
-                "status": status,
-            }
-        )
-        if len(items) >= limit:
-            break
+        item = {
+            "id": thread_id,
+            "cwd": cwd,
+            "preview": preview,
+            "name": preview,
+            "path": str(path),
+            "updated_at": updated_at,
+            "status": status,
+        }
+        entries.append(item)
+        by_thread_id[thread_id] = item
+
+    return LocalThreadIndexState(
+        signature=signature,
+        entries=entries,
+        by_thread_id=by_thread_id,
+        last_loaded_at=time.time(),
+        dirty=False,
+    )
+
+
+def build_local_thread_index() -> LocalThreadIndexState:
+    codex_root = Path.home() / ".codex"
+    signature = local_thread_index_signature()
+    cached_payload = read_local_thread_index_cache()
+    cached_state = hydrate_local_thread_index_state(cached_payload) if cached_payload else None
+    if cached_state and cached_state.signature == signature:
+        return cached_state
+
+    index_map = load_session_index_map()
+    if not cached_state:
+        files = [
+            *sorted((codex_root / "sessions").glob("**/*.jsonl"), reverse=True),
+            *sorted((codex_root / "archived_sessions").glob("**/*.jsonl"), reverse=True),
+        ]
+        state = build_local_thread_index_from_files(files, index_map, signature)
+        save_local_thread_index_cache(state)
+        return state
+
+    previous_by_thread = dict(cached_state.by_thread_id)
+    entries: list[dict[str, Any]] = []
+    by_thread_id: dict[str, dict[str, Any]] = {}
+    ordered_ids = sorted(
+        index_map.keys(),
+        key=lambda thread_id: index_map.get(thread_id, {}).get("updated_at") or "",
+        reverse=True,
+    )
+
+    for thread_id in ordered_ids:
+        cached_item = previous_by_thread.pop(thread_id, None)
+        session_path = None
+        if cached_item:
+            cached_path = Path(str(cached_item.get("path") or ""))
+            if cached_path.exists():
+                session_path = cached_path
+        if not session_path:
+            candidates = find_session_file_candidates(thread_id)
+            session_path = candidates[0] if candidates else None
+        if not session_path:
+            continue
+        meta = extract_session_meta(session_path)
+        cwd = str(meta.get("cwd") or "").strip() if meta else str((cached_item or {}).get("cwd") or "").strip()
+        if not cwd:
+            continue
+        index_item = index_map.get(thread_id, {})
+        preview = index_item.get("name") or str((cached_item or {}).get("preview") or thread_id)
+        updated_at = index_item.get("updated_at") or str((cached_item or {}).get("updated_at") or "")
+        if not updated_at:
+            updated_at = datetime.fromtimestamp(path_mtime(session_path)).isoformat()
+        status = {"type": "archived"} if "archived_sessions" in str(session_path) else {}
+        item = {
+            "id": thread_id,
+            "cwd": cwd,
+            "preview": preview,
+            "name": preview,
+            "path": str(session_path),
+            "updated_at": updated_at,
+            "status": status,
+        }
+        entries.append(item)
+        by_thread_id[thread_id] = item
+
+    for thread_id, cached_item in previous_by_thread.items():
+        cached_path = Path(str(cached_item.get("path") or ""))
+        if not cached_path.exists():
+            continue
+        item = dict(cached_item)
+        entries.append(item)
+        by_thread_id[thread_id] = item
+
+    state = LocalThreadIndexState(
+        signature=signature,
+        entries=entries,
+        by_thread_id=by_thread_id,
+        last_loaded_at=time.time(),
+        dirty=False,
+    )
+    save_local_thread_index_cache(state)
+    return state
+
+
+def get_local_thread_index() -> LocalThreadIndexState:
+    signature = local_thread_index_signature()
+    if (
+        not LOCAL_THREAD_INDEX.dirty
+        and
+        LOCAL_THREAD_INDEX.signature == signature
+        and (time.time() - LOCAL_THREAD_INDEX.last_loaded_at) <= LOCAL_THREAD_INDEX_WARM_TTL_SECONDS
+    ):
+        return LOCAL_THREAD_INDEX
+    rebuilt = build_local_thread_index()
+    LOCAL_THREAD_INDEX.signature = rebuilt.signature
+    LOCAL_THREAD_INDEX.entries = rebuilt.entries
+    LOCAL_THREAD_INDEX.by_thread_id = rebuilt.by_thread_id
+    LOCAL_THREAD_INDEX.last_loaded_at = rebuilt.last_loaded_at
+    LOCAL_THREAD_INDEX.dirty = False
+    return LOCAL_THREAD_INDEX
+
+
+def list_local_threads(repo_path: Path, history_ids: list[str], limit: int = 200) -> list[dict[str, Any]]:
+    index = get_local_thread_index()
+    repo_str = str(repo_path.resolve())
+    items = [item for item in index.entries if item.get("cwd") == repo_str]
 
     history_rank = {thread_id: index for index, thread_id in enumerate(history_ids)}
     def sort_timestamp(raw: str | None) -> float:
@@ -1571,7 +2206,7 @@ def list_local_threads(repo_path: Path, history_ids: list[str], limit: int = 200
             -sort_timestamp(item.get("updated_at")),
         )
     )
-    return items
+    return items[:limit]
 
 
 async def get_repo_thread_list(
@@ -1598,7 +2233,13 @@ def get_chat_reasoning_effort(
 
 
 def get_chat_sandbox(settings: Settings, store: SessionStore, chat_id: int) -> str:
-    return store.get_sandbox(chat_id) or settings.codex_sandbox
+    sandbox = store.get_sandbox(chat_id)
+    expires_at = store.get_full_access_expires_at(chat_id)
+    if sandbox == "danger-full-access" and expires_at and time.time() >= expires_at:
+        store.set_sandbox(chat_id, None)
+        store.set_full_access_expires_at(chat_id, None)
+        return settings.codex_default_sandbox
+    return sandbox or settings.codex_sandbox
 
 
 def get_chat_verbose(store: SessionStore, chat_id: int) -> str:
@@ -1671,6 +2312,111 @@ def build_control_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def build_full_access_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("确认 Full", callback_data="control:access_confirm:full"),
+                InlineKeyboardButton("取消 Cancel", callback_data="control:access_cancel"),
+            ]
+        ]
+    )
+
+
+def build_approval_keyboard(token: str, include_session: bool = True) -> InlineKeyboardMarkup:
+    first_row = [
+        InlineKeyboardButton("允许一次 Allow once", callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:once"),
+    ]
+    if include_session:
+        first_row.append(
+            InlineKeyboardButton("本会话允许 Session", callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:session")
+        )
+    second_row = [
+        InlineKeyboardButton("拒绝 Decline", callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:decline"),
+        InlineKeyboardButton("取消 Turn", callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:cancel"),
+    ]
+    return InlineKeyboardMarkup([first_row, second_row])
+
+
+def build_user_input_keyboard(
+    token: str,
+    questions: list[dict[str, Any]],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if len(questions) == 1:
+        options = questions[0].get("options") or []
+        if isinstance(options, list):
+            option_buttons: list[InlineKeyboardButton] = []
+            for option_index, option in enumerate(options[:4]):
+                if not isinstance(option, dict):
+                    continue
+                label = str(option.get("label") or f"选项 {option_index + 1}").strip()
+                if not label:
+                    continue
+                option_buttons.append(
+                    InlineKeyboardButton(
+                        shorten_middle(label, 24),
+                        callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:pick:0:{option_index}",
+                    )
+                )
+            while option_buttons:
+                rows.append(option_buttons[:2])
+                option_buttons = option_buttons[2:]
+    rows.append(
+        [
+            InlineKeyboardButton("跳过 Skip", callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:skip"),
+            InlineKeyboardButton("取消 Turn", callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:cancel"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_mcp_elicitation_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("拒绝 Decline", callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:decline"),
+                InlineKeyboardButton("取消 Turn", callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:cancel"),
+            ]
+        ]
+    )
+
+
+def build_dynamic_tool_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("发送参数 Send", callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:echo"),
+                InlineKeyboardButton("拒绝 Decline", callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:decline"),
+            ],
+            [
+                InlineKeyboardButton("取消 Turn", callback_data=f"{APPROVAL_CALLBACK_PREFIX}:{token}:cancel"),
+            ],
+        ]
+    )
+
+
+def build_request_keyboard(pending: PendingApproval) -> InlineKeyboardMarkup:
+    if pending.method == "item/tool/requestUserInput":
+        return build_user_input_keyboard(pending.token, pending.user_input_questions)
+    if pending.method == "mcpServer/elicitation/request":
+        return build_mcp_elicitation_keyboard(pending.token)
+    if pending.method == "item/tool/call":
+        return build_dynamic_tool_keyboard(pending.token)
+    include_session = pending.method in {
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+    }
+    return build_approval_keyboard(pending.token, include_session=include_session)
+
+
+def build_mcp_elicitation_result(action: str) -> dict[str, Any]:
+    return {
+        "action": action,
+        "content": {} if action == "accept" else None,
+    }
 
 
 async def list_repo_threads(
@@ -1794,25 +2540,27 @@ def resolve_thread_selector(
 
 
 def find_session_path_by_thread_id(thread_id: str) -> Path | None:
-    codex_root = Path.home() / ".codex"
-    patterns = [
-        codex_root / "sessions" / "**" / f"*-{thread_id}.jsonl",
-        codex_root / "archived_sessions" / f"*-{thread_id}.jsonl",
-    ]
-    for pattern in patterns:
-        matches = list(glob.glob(str(pattern), recursive=True))
-        if matches:
-            return Path(matches[0])
+    cached = get_local_thread_index().by_thread_id.get(thread_id)
+    if cached:
+        session_path_raw = cached.get("path")
+        if isinstance(session_path_raw, str) and session_path_raw:
+            session_path = Path(session_path_raw)
+            if session_path.exists():
+                return session_path
+    candidates = find_session_file_candidates(thread_id)
+    if candidates:
+        return candidates[0]
     return None
 
 
 def build_thread_stub(thread_id: str) -> dict[str, Any]:
+    cached = get_local_thread_index().by_thread_id.get(thread_id)
     session_path = find_session_path_by_thread_id(thread_id)
     return {
         "id": thread_id,
-        "preview": thread_id,
+        "preview": (cached or {}).get("preview") or thread_id,
         "path": str(session_path) if session_path else "",
-        "status": {},
+        "status": (cached or {}).get("status") or {},
     }
 
 
@@ -1889,6 +2637,7 @@ async def run_single_prompt(
     thread_id: str,
     prompt: str,
     *,
+    input_items: list[dict[str, Any]] | None = None,
     timeout_seconds: int = 240,
 ) -> str:
     loop = asyncio.get_running_loop()
@@ -1930,7 +2679,7 @@ async def run_single_prompt(
 
     client.add_notification_handler(handler)
     try:
-        turn_id = await client.start_turn(thread_id, prompt)
+        turn_id = await client.start_turn(thread_id, prompt, input_items)
         state["turn_id"] = turn_id
         return await asyncio.wait_for(result_future, timeout=timeout_seconds)
     finally:
@@ -1977,11 +2726,13 @@ async def summarize_transcript_with_model(
         ]
     )
     temp_thread_id = await client.start_thread(repo_path, runtime_config)
+    invalidate_local_thread_index_cache()
     try:
         summary = await run_single_prompt(client, temp_thread_id, "\n".join(prompt_lines))
     finally:
         try:
             await client.archive_thread(temp_thread_id)
+            invalidate_local_thread_index_cache()
         except Exception:
             pass
     return summary.strip()
@@ -2077,6 +2828,33 @@ def build_thread_runtime_config(
     if effort:
         payload["reasoningEffort"] = effort
     return payload
+
+
+def runtime_info_from_runtime_config(
+    runtime_config: dict[str, Any],
+    settings: Settings,
+) -> tuple[str | None, str | None]:
+    model = runtime_config.get("model")
+    effort = runtime_config.get("reasoningEffort")
+    normalized_model = model if isinstance(model, str) and model else settings.codex_model
+    normalized_effort = effort if isinstance(effort, str) and effort else settings.codex_reasoning_effort
+    return normalized_model, normalized_effort
+
+
+def cache_runtime_snapshot(
+    store: SessionStore,
+    settings: Settings,
+    chat_id: int,
+    thread_id: str,
+    runtime_config: dict[str, Any],
+) -> None:
+    model, effort = runtime_info_from_runtime_config(runtime_config, settings)
+    store.set_runtime_snapshot(
+        chat_id,
+        thread_id=thread_id,
+        model=model,
+        effort=effort,
+    )
 
 
 def telegram_menu_commands() -> list[tuple[str, str]]:
@@ -2193,10 +2971,7 @@ def load_local_model_catalog() -> list[dict[str, Any]]:
     return catalog
 
 
-def get_available_models() -> list[dict[str, Any]]:
-    catalog = load_local_model_catalog()
-    if catalog:
-        return catalog
+def build_fallback_model_catalog() -> list[dict[str, Any]]:
     return [
         {
             "slug": slug,
@@ -2207,20 +2982,77 @@ def get_available_models() -> list[dict[str, Any]]:
     ]
 
 
-def resolve_model_alias(raw: str) -> str:
+def normalize_app_server_model_catalog(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    catalog: list[dict[str, Any]] = []
+    for item in items:
+        slug = str(item.get("model") or item.get("id") or "").strip()
+        if not slug:
+            continue
+        if item.get("hidden") is True:
+            continue
+        label = str(item.get("displayName") or "").strip() or format_model_name(slug)
+        efforts_raw = item.get("supportedReasoningEfforts") or []
+        efforts: list[str] = []
+        if isinstance(efforts_raw, list):
+            for effort_item in efforts_raw:
+                if not isinstance(effort_item, dict):
+                    continue
+                effort = str(effort_item.get("reasoningEffort") or "").strip().lower()
+                if effort in VALID_REASONING_EFFORTS and effort not in efforts:
+                    efforts.append(effort)
+        default_effort = str(item.get("defaultReasoningEffort") or "").strip().lower()
+        if default_effort in VALID_REASONING_EFFORTS and default_effort not in efforts:
+            efforts.insert(0, default_effort)
+        catalog.append(
+            {
+                "slug": slug,
+                "label": label,
+                "efforts": efforts or list(VALID_REASONING_EFFORTS),
+            }
+        )
+    return catalog
+
+
+async def get_model_catalog(
+    client: CodexAppServerClient | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    if client:
+        try:
+            catalog = normalize_app_server_model_catalog(await client.list_models())
+            if catalog:
+                return catalog, "app-server"
+        except Exception:
+            pass
+    catalog = load_local_model_catalog()
+    if catalog:
+        return catalog, "local cache"
+    return build_fallback_model_catalog(), "fallback"
+
+
+def get_available_models() -> list[dict[str, Any]]:
+    catalog = load_local_model_catalog()
+    if catalog:
+        return catalog
+    return build_fallback_model_catalog()
+
+
+def resolve_model_alias(raw: str, catalog: list[dict[str, Any]] | None = None) -> str:
     candidate = raw.strip()
     if not candidate:
         return candidate
     lowered = candidate.lower()
-    for item in get_available_models():
+    for item in (catalog or get_available_models()):
         if lowered in {item["slug"].lower(), item["label"].lower()}:
             return str(item["slug"])
     return candidate
 
 
-def get_supported_efforts_for_model(model: str | None) -> tuple[str, ...]:
+def get_supported_efforts_for_model(
+    model: str | None,
+    catalog: list[dict[str, Any]] | None = None,
+) -> tuple[str, ...]:
     active = (model or "").strip().lower()
-    for item in get_available_models():
+    for item in (catalog or get_available_models()):
         if item["slug"].lower() == active:
             return tuple(item["efforts"])
     return VALID_REASONING_EFFORTS
@@ -2252,7 +3084,7 @@ async def reject_unauthorized(update: Update) -> None:
 
 
 async def bootstrap_notice(update: Update, settings: Settings) -> None:
-    if settings.allowed_chat_ids:
+    if settings.allowed_chat_ids or not settings.allow_all_chats:
         return
     message = update.effective_message
     chat = update.effective_chat
@@ -2273,8 +3105,92 @@ def mark_poll_ok(application: Application) -> None:
     health: PollingHealth | None = application.bot_data.get("health")
     if not health:
         return
+    previous_disconnect_at = health.last_disconnect_at
     health.last_ok_at = time.time()
     health.last_error_text = None
+    if health.reconnect_notice_pending and previous_disconnect_at:
+        asyncio.create_task(complete_reconnect_notice(application, previous_disconnect_at, health.last_ok_at))
+
+
+def install_polling_probe(bot_instance: Any, application: Application) -> None:
+    bot_type = type(bot_instance)
+    POLLING_PROBE_APPLICATIONS[id(bot_instance)] = application
+    if bot_type in POLLING_PROBE_TYPES:
+        return
+    original_get_updates = bot_type.get_updates
+
+    async def wrapped_get_updates(self, *args, **kwargs):
+        updates = await original_get_updates(self, *args, **kwargs)
+        bound_application = POLLING_PROBE_APPLICATIONS.get(id(self))
+        if bound_application:
+            mark_poll_ok(bound_application)
+        return updates
+
+    bot_type.get_updates = wrapped_get_updates
+    POLLING_PROBE_TYPES.add(bot_type)
+
+
+async def warm_local_thread_index_cache() -> None:
+    await asyncio.to_thread(get_local_thread_index)
+
+
+def reconnect_notice_chat_ids(application: Application) -> list[int]:
+    settings: Settings = application.bot_data["settings"]
+    store: SessionStore = application.bot_data["store"]
+    if settings.allowed_chat_ids:
+        return sorted(settings.allowed_chat_ids)
+    prefs = store.data.get("chat_prefs", {})
+    if not isinstance(prefs, dict):
+        return []
+    chat_ids: list[int] = []
+    for raw in prefs.keys():
+        try:
+            chat_ids.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(chat_ids))
+
+
+async def complete_reconnect_notice(
+    application: Application,
+    disconnected_at: float,
+    recovered_at: float,
+) -> bool:
+    health: PollingHealth | None = application.bot_data.get("health")
+    if not health:
+        return False
+    if not health.reconnect_notice_pending:
+        return False
+    if health.last_reconnect_notice_for == disconnected_at:
+        return False
+    delivered = await send_reconnect_notice(application, disconnected_at, recovered_at)
+    if not delivered and reconnect_notice_chat_ids(application):
+        return False
+    health.last_recovered_at = recovered_at
+    health.reconnect_notice_pending = False
+    health.last_reconnect_notice_for = disconnected_at
+    return True
+
+
+async def send_reconnect_notice(
+    application: Application,
+    disconnected_at: float,
+    recovered_at: float,
+) -> bool:
+    duration = max(0, int(recovered_at - disconnected_at))
+    text = (
+        "Telegram 连接已恢复。\n"
+        f"断线时长: {format_elapsed(duration)}\n"
+        "断线期间的积压消息会继续拉取处理。"
+    )
+    delivered = False
+    for chat_id in reconnect_notice_chat_ids(application):
+        try:
+            await application.bot.send_message(chat_id=chat_id, text=text)
+            delivered = True
+        except Exception:
+            continue
+    return delivered
 
 
 def build_attachment_prompt(
@@ -2291,6 +3207,220 @@ def build_attachment_prompt(
             lines.append("  预览:")
             lines.append(preview)
     return "\n".join(lines).strip()
+
+
+def normalize_input_text(text: str) -> str:
+    return text.replace("\r\n", "\n").strip()
+
+
+def parse_structured_links(text: str) -> tuple[str, list[dict[str, Any]]]:
+    items: list[dict[str, Any]] = []
+    kept_parts: list[str] = []
+    last_end = 0
+
+    for match in STRUCTURED_LINK_PATTERN.finditer(text):
+        label = match.group(1).strip()
+        path = match.group(2).strip()
+        kept_parts.append(text[last_end:match.start()])
+        consumed = False
+        if label.startswith("$") and path:
+            items.append(
+                {
+                    "type": "skill",
+                    "name": label[1:].strip() or label,
+                    "path": path,
+                }
+            )
+            consumed = True
+        elif path.startswith("app://") or path.startswith("plugin://"):
+            items.append(
+                {
+                    "type": "mention",
+                    "name": label or path,
+                    "path": path,
+                }
+            )
+            consumed = True
+        if not consumed:
+            kept_parts.append(match.group(0))
+        last_end = match.end()
+
+    kept_parts.append(text[last_end:])
+    cleaned = normalize_input_text("".join(kept_parts))
+    return cleaned, items
+
+
+def build_structured_input(
+    *,
+    prompt: str,
+    attachments: list[tuple[str, Path, str | None]] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    cleaned_text, items = parse_structured_links(prompt)
+    attachment_lines: list[str] = []
+
+    for kind, path, preview in attachments or []:
+        resolved = str(path.resolve())
+        if path.suffix.lower() in IMAGE_SUFFIXES:
+            items.append({"type": "localImage", "path": resolved})
+            attachment_lines.append(f"- 图片: {resolved}")
+            continue
+        attachment_lines.append(f"- {kind}: {resolved}")
+        attachment_lines.append("  说明: 你可以直接读取这个本地路径。")
+        if preview:
+            attachment_lines.append("  预览:")
+            attachment_lines.append(preview)
+
+    merged_text_parts = [part for part in [cleaned_text] if part]
+    if attachment_lines:
+        merged_text_parts.extend(["附件", *attachment_lines])
+    merged_text = normalize_input_text("\n\n".join(merged_text_parts))
+    if merged_text:
+        items.insert(0, {"type": "text", "text": merged_text, "text_elements": []})
+    display_prompt = merged_text or cleaned_text or "根据附件继续处理。"
+    return display_prompt, items
+
+
+def normalize_dynamic_tool_image_url(value: str, *, assume_image: bool = False) -> str | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if lowered.startswith("data:image/"):
+        return raw
+    if lowered.startswith(("http://", "https://", "file://")):
+        base = lowered.split("?", 1)[0].split("#", 1)[0]
+        if assume_image or any(base.endswith(ext) for ext in IMAGE_SUFFIXES):
+            return raw
+        return None
+    path = Path(raw)
+    if path.is_absolute() and path.suffix.lower() in IMAGE_SUFFIXES and path.exists():
+        return path.resolve().as_uri()
+    return None
+
+
+def build_dynamic_tool_data_uri(mime_type: str, payload: str) -> str:
+    return f"data:{mime_type};base64,{payload}"
+
+
+def normalize_dynamic_tool_data_uri(mime_type: str | None, payload: Any) -> str | None:
+    normalized_mime = (mime_type or "").strip().lower()
+    if not normalized_mime.startswith("image/"):
+        return None
+    if isinstance(payload, str):
+        raw = payload.strip()
+        if not raw:
+            return None
+        if raw.lower().startswith("data:image/"):
+            return raw
+        try:
+            base64.b64decode(raw, validate=True)
+        except Exception:
+            return None
+        return build_dynamic_tool_data_uri(normalized_mime, raw)
+    if isinstance(payload, list) and all(isinstance(item, int) for item in payload):
+        try:
+            encoded = base64.b64encode(bytes(payload)).decode("ascii")
+        except Exception:
+            return None
+        return build_dynamic_tool_data_uri(normalized_mime, encoded)
+    return None
+
+
+def collect_dynamic_tool_rich_items(arguments: Any) -> list[dict[str, Any]]:
+    discovered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def walk(value: Any, key_hint: str = "") -> None:
+        if len(discovered) >= DYNAMIC_TOOL_IMAGE_LIMIT:
+            return
+        if isinstance(value, dict):
+            mime_type = str(
+                value.get("mimeType")
+                or value.get("mediaType")
+                or value.get("contentType")
+                or ""
+            ).strip()
+            data_value = value.get("data")
+            if data_value is None:
+                data_value = value.get("base64")
+            if data_value is None:
+                data_value = value.get("bytes")
+            data_uri = normalize_dynamic_tool_data_uri(mime_type, data_value)
+            if data_uri and data_uri not in seen:
+                seen.add(data_uri)
+                discovered.append({"type": "inputImage", "imageUrl": data_uri})
+                if len(discovered) >= DYNAMIC_TOOL_IMAGE_LIMIT:
+                    return
+            for key, nested in value.items():
+                walk(nested, str(key).strip().lower())
+            return
+        if isinstance(value, list):
+            for nested in value:
+                walk(nested, key_hint)
+            return
+        if not isinstance(value, str):
+            return
+        key_suggests_image = key_hint in {
+            "image",
+            "imageurl",
+            "image_url",
+            "screenshot",
+            "thumbnail",
+            "photo",
+            "preview",
+        }
+        should_try = key_suggests_image or value.lower().startswith(("http://", "https://", "file://")) or Path(value).suffix.lower() in IMAGE_SUFFIXES
+        if not should_try:
+            return
+        image_url = normalize_dynamic_tool_image_url(value, assume_image=key_suggests_image)
+        if not image_url or image_url in seen:
+            return
+        seen.add(image_url)
+        discovered.append({"type": "inputImage", "imageUrl": image_url})
+
+    walk(arguments)
+    return discovered
+
+
+def build_dynamic_tool_content_items(tool_name: str, arguments: Any) -> list[dict[str, Any]]:
+    summary_lines = [
+        f"动态工具调用: {tool_name}",
+        "Telegram bridge 返回了工具请求参数。",
+    ]
+    try:
+        rendered_arguments = json.dumps(arguments, ensure_ascii=False, indent=2)
+    except TypeError:
+        rendered_arguments = str(arguments)
+    content_items: list[dict[str, Any]] = [
+        {"type": "inputText", "text": "\n".join(summary_lines)},
+        {"type": "inputText", "text": rendered_arguments},
+    ]
+    content_items.extend(collect_dynamic_tool_rich_items(arguments))
+    return content_items
+
+
+def build_dynamic_tool_result(
+    tool_name: str,
+    arguments: Any,
+    *,
+    success: bool,
+    mode: str,
+) -> dict[str, Any]:
+    if mode == "echo":
+        return {
+            "success": success,
+            "contentItems": build_dynamic_tool_content_items(tool_name, arguments),
+        }
+    action_text = "decline" if mode == "decline" else "cancel"
+    return {
+        "success": success,
+        "contentItems": [
+            {
+                "type": "inputText",
+                "text": f"Telegram bridge {action_text} dynamic tool call: {tool_name}",
+            }
+        ],
+    }
 
 
 def maybe_inline_file_preview(path: Path, max_chars: int = 6000) -> str | None:
@@ -2344,6 +3474,7 @@ async def build_status_text(
         repo_key if repo_key in settings.repos else None,
     )
     effective_sandbox = get_chat_sandbox(settings, store, chat_id)
+    full_access_expires_at = store.get_full_access_expires_at(chat_id)
     lines = [
         f"repo: {repo_key}",
         f"thread: {thread_id}",
@@ -2355,6 +3486,9 @@ async def build_status_text(
         f"polling: {format_polling_health(health)}",
         f"approval: {settings.codex_approval}",
     ]
+    if effective_sandbox == "danger-full-access" and full_access_expires_at:
+        remaining = max(0, int(full_access_expires_at - time.time()))
+        lines.append(f"full_access_ttl: {format_elapsed(remaining)}")
     if active:
         lines.extend(
             [
@@ -2375,6 +3509,7 @@ async def build_health_text(
     health: PollingHealth,
 ) -> str:
     edit_queue: TelegramEditQueue | None = application.bot_data.get("edit_queue")
+    approvals: ApprovalManager | None = application.bot_data.get("approvals")
     process = client.process
     app_server_state = "运行中" if process and process.returncode is None else "未运行"
     app_server_pid = str(process.pid) if process and process.returncode is None else "无"
@@ -2386,18 +3521,524 @@ async def build_health_text(
         f"polling: {format_polling_health(health)}",
         f"last_ok: {format_age_line(health.last_ok_at)}",
         f"last_conflict: {format_age_line(health.last_conflict_at)}",
+        f"last_disconnect: {format_age_line(health.last_disconnect_at)}",
+        f"last_recovered: {format_age_line(health.last_recovered_at)}",
         f"app_server: {app_server_state}",
         f"app_server_pid: {app_server_pid}",
         f"active_turns: {len(conversations.active_by_chat)}",
         f"loaded_threads: {len(client.loaded_threads)}",
         f"pending_rpc: {len(client.pending)}",
         f"pending_edits: {edit_queue.pending_count() if edit_queue else 0}",
+        f"pending_approvals: {approvals.pending_count() if approvals else 0}",
         f"state_dir: {settings.state_dir}",
         f"codex_command: {' '.join(settings.codex_command)}",
     ]
     if health.last_error_text:
         lines.extend(["last_error:", health.last_error_text])
     return "\n".join(lines)
+
+
+class ApprovalManager:
+    def __init__(
+        self,
+        settings: Settings,
+        store: SessionStore,
+        conversations: ConversationManager,
+    ) -> None:
+        self.settings = settings
+        self.store = store
+        self.conversations = conversations
+        self.application: Application | None = None
+        self.pending: dict[str, PendingApproval] = {}
+        self._restore_pending_requests()
+
+    def bind_application(self, application: Application) -> None:
+        self.application = application
+
+    def pending_count(self) -> int:
+        self._purge_expired_pending()
+        return len(self.pending)
+
+    def _is_pending_expired(self, pending: PendingApproval, now: float | None = None) -> bool:
+        current = now if now is not None else time.time()
+        return pending.created_at + APPROVAL_TIMEOUT_SECONDS <= current
+
+    def _purge_expired_pending(self) -> None:
+        now = time.time()
+        expired_tokens = [
+            token for token, pending in self.pending.items() if self._is_pending_expired(pending, now)
+        ]
+        for token in expired_tokens:
+            self._drop_pending(token)
+
+    def _serialize_pending(self, pending: PendingApproval) -> dict[str, Any]:
+        return {
+            "token": pending.token,
+            "request_id": pending.request_id,
+            "method": pending.method,
+            "chat_id": pending.chat_id,
+            "thread_id": pending.thread_id,
+            "turn_id": pending.turn_id,
+            "item_id": pending.item_id,
+            "prompt_text": pending.prompt_text,
+            "requested_permissions": pending.requested_permissions,
+            "user_input_questions": pending.user_input_questions,
+            "dynamic_tool_name": pending.dynamic_tool_name,
+            "dynamic_tool_arguments": pending.dynamic_tool_arguments,
+            "message_id": pending.message_id,
+            "created_at": pending.created_at,
+        }
+
+    def _persist_pending(self, pending: PendingApproval) -> None:
+        self.store.save_pending_request(self._serialize_pending(pending))
+
+    def _drop_pending(self, token: str) -> None:
+        self.pending.pop(token, None)
+        self.store.delete_pending_request(token)
+
+    def _restore_pending_requests(self) -> None:
+        now = time.time()
+        for record in self.store.list_pending_requests():
+            token = str(record.get("token") or "").strip()
+            if not token:
+                continue
+            created_at_raw = record.get("created_at")
+            created_at = float(created_at_raw) if isinstance(created_at_raw, (int, float)) else now
+            if created_at + APPROVAL_TIMEOUT_SECONDS <= now:
+                self.store.delete_pending_request(token)
+                continue
+            pending = PendingApproval(
+                token=token,
+                request_id=record.get("request_id") or token,
+                method=str(record.get("method") or "").strip(),
+                chat_id=int(record.get("chat_id") or 0),
+                thread_id=str(record.get("thread_id") or "").strip(),
+                turn_id=str(record.get("turn_id") or "").strip(),
+                item_id=str(record.get("item_id") or "").strip(),
+                prompt_text=str(record.get("prompt_text") or "").strip() or "待处理请求",
+                result_future=None,
+                requested_permissions=record.get("requested_permissions")
+                if isinstance(record.get("requested_permissions"), dict)
+                else None,
+                user_input_questions=record.get("user_input_questions")
+                if isinstance(record.get("user_input_questions"), list)
+                else [],
+                dynamic_tool_name=str(record.get("dynamic_tool_name") or "").strip() or None,
+                dynamic_tool_arguments=record.get("dynamic_tool_arguments"),
+                message_id=int(record.get("message_id")) if isinstance(record.get("message_id"), int) else None,
+                created_at=created_at,
+                stale=True,
+            )
+            self.pending[token] = pending
+
+    async def handle_notification(self, payload: dict[str, Any]) -> None:
+        if payload.get("method") != "serverRequest/resolved":
+            return
+        params = payload.get("params", {})
+        request_id = params.get("requestId")
+        thread_id = str(params.get("threadId") or "").strip()
+        if request_id is None:
+            return
+        for token, pending in list(self.pending.items()):
+            if pending.request_id != request_id:
+                continue
+            if thread_id and pending.thread_id and pending.thread_id != thread_id:
+                continue
+            self._drop_pending(token)
+
+    def _format_result_for_message(
+        self,
+        pending: PendingApproval,
+        action: str,
+        result: dict[str, Any],
+    ) -> str:
+        if pending.method == "item/tool/requestUserInput":
+            answers = result.get("answers") or {}
+            if answers:
+                return f"{action}: {json.dumps(answers, ensure_ascii=False)}"
+            return action
+        if pending.method == "mcpServer/elicitation/request":
+            return f"{action}: {json.dumps(result, ensure_ascii=False)}"
+        if pending.method == "item/tool/call":
+            return f"{action}: {pending.dynamic_tool_name or 'dynamic-tool'}"
+        return action
+
+    def _build_recovery_prompt(
+        self,
+        pending: PendingApproval,
+        action: str,
+        result: dict[str, Any],
+    ) -> str:
+        lines = [
+            "系统恢复说明",
+            "上一个 Telegram bridge 进程在处理中途重启了。",
+            "下面是用户刚刚对旧请求做出的决定，请你在当前线程继续处理，并把它视为最新约束。",
+            "",
+            f"请求类型: {pending.method}",
+            f"thread: {pending.thread_id}",
+            f"turn: {pending.turn_id}",
+        ]
+        if pending.dynamic_tool_name:
+            lines.append(f"tool: {pending.dynamic_tool_name}")
+        lines.extend(
+            [
+                "",
+                "原始请求",
+                pending.prompt_text,
+                "",
+                f"用户选择: {action}",
+                "结构化结果",
+                json.dumps(result, ensure_ascii=False, indent=2),
+            ]
+        )
+        return "\n".join(lines)
+
+    async def recover_stale_request(
+        self,
+        application: Application,
+        pending: PendingApproval,
+        action: str,
+        result: dict[str, Any],
+    ) -> ActiveTurn | None:
+        repo_key = resolve_repo_key_for_thread(
+            self.settings,
+            self.store,
+            pending.chat_id,
+            pending.thread_id,
+        )
+        if not repo_key:
+            return None
+
+        active = self.conversations.get_active(pending.chat_id)
+        recovery_prompt = self._build_recovery_prompt(pending, action, result)
+        if active and active.thread_id == pending.thread_id:
+            return await self.conversations.steer_chat_turn(
+                pending.chat_id,
+                recovery_prompt,
+            )
+        if active:
+            return None
+
+        if pending.thread_id:
+            try:
+                await self.conversations.switch_thread(
+                    pending.chat_id,
+                    repo_key,
+                    pending.thread_id,
+                )
+            except Exception:
+                current_thread_id = self.store.get_thread_id(pending.chat_id)
+                if current_thread_id != pending.thread_id:
+                    return None
+
+        return await self.conversations.start_chat_turn(
+            pending.chat_id,
+            repo_key,
+            recovery_prompt,
+            force_new=False,
+        )
+
+    def _resolve_chat_id(self, thread_id: str, turn_id: str) -> int | None:
+        active = self.conversations.active_by_turn.get(turn_id)
+        if active:
+            return active.chat_id
+        return self.store.find_chat_id_by_thread(thread_id)
+
+    def _normalize_method(self, method: str) -> str:
+        if method == "applyPatchApproval":
+            return "item/fileChange/requestApproval"
+        if method == "execCommandApproval":
+            return "item/commandExecution/requestApproval"
+        return method
+
+    def _default_result_for_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        normalized_method = self._normalize_method(method)
+        if normalized_method == "item/permissions/requestApproval":
+            return {"permissions": {}, "scope": "turn"}
+        if normalized_method == "item/tool/requestUserInput":
+            return {"answers": {}}
+        if normalized_method == "mcpServer/elicitation/request":
+            return build_mcp_elicitation_result("decline")
+        if normalized_method == "item/tool/call":
+            return build_dynamic_tool_result(
+                str(params.get("tool") or "dynamic-tool"),
+                params.get("arguments"),
+                success=False,
+                mode="cancel",
+            )
+        if normalized_method == "account/chatgptAuthTokens/refresh":
+            return {}
+        return {"decision": "cancel"}
+
+    def _build_prompt_text(self, method: str, params: dict[str, Any]) -> str:
+        normalized_method = self._normalize_method(method)
+        if normalized_method == "item/tool/requestUserInput":
+            lines = ["需要补充输入", f"thread: {params.get('threadId')}", f"turn: {params.get('turnId')}"]
+            questions = params.get("questions") or []
+            if isinstance(questions, list):
+                for index, question in enumerate(questions[:3], start=1):
+                    if not isinstance(question, dict):
+                        continue
+                    header = str(question.get("header") or "").strip()
+                    body = str(question.get("question") or "").strip()
+                    if header:
+                        lines.extend(["", f"{index}. {header}"])
+                    elif body:
+                        lines.extend(["", f"{index}."])
+                    if body:
+                        lines.append(body)
+                    options = question.get("options") or []
+                    if isinstance(options, list):
+                        for option in options[:4]:
+                            if not isinstance(option, dict):
+                                continue
+                            label = str(option.get("label") or "").strip()
+                            description = str(option.get("description") or "").strip()
+                            if label and description:
+                                lines.append(f"- {label}: {description}")
+                            elif label:
+                                lines.append(f"- {label}")
+            return "\n".join(lines)
+
+        if normalized_method == "mcpServer/elicitation/request":
+            lines = ["MCP 交互请求", f"thread: {params.get('threadId')}", f"turn: {params.get('turnId')}"]
+            server_name = str(params.get("serverName") or "").strip()
+            message = str(params.get("message") or "").strip()
+            if server_name:
+                lines.append(f"server: {server_name}")
+            if message:
+                lines.extend(["", message])
+            return "\n".join(lines)
+
+        if normalized_method == "item/tool/call":
+            tool_name = str(params.get("tool") or "").strip() or "dynamic-tool"
+            lines = ["动态工具调用", f"thread: {params.get('threadId')}", f"turn: {params.get('turnId')}", f"tool: {tool_name}"]
+            arguments = params.get("arguments")
+            if arguments is not None:
+                try:
+                    rendered = json.dumps(arguments, ensure_ascii=False, indent=2)
+                except TypeError:
+                    rendered = str(arguments)
+                lines.extend(["", "arguments", rendered])
+            return "\n".join(lines)
+
+        if method == "item/commandExecution/requestApproval":
+            lines = ["命令审批", f"thread: {params.get('threadId')}", f"turn: {params.get('turnId')}"]
+            command = str(params.get("command") or "").strip()
+            cwd = str(params.get("cwd") or "").strip()
+            reason = str(params.get("reason") or "").strip()
+            if command:
+                lines.extend(["", "命令", command])
+            if cwd:
+                lines.append(f"cwd: {cwd}")
+            if reason:
+                lines.extend(["", "原因", reason])
+            return "\n".join(lines)
+
+        if method == "item/fileChange/requestApproval":
+            lines = ["文件变更审批", f"thread: {params.get('threadId')}", f"turn: {params.get('turnId')}"]
+            grant_root = str(params.get("grantRoot") or "").strip()
+            reason = str(params.get("reason") or "").strip()
+            if grant_root:
+                lines.extend(["", "写入范围", grant_root])
+            if reason:
+                lines.extend(["", "原因", reason])
+            return "\n".join(lines)
+
+        if method == "item/permissions/requestApproval":
+            permissions = params.get("permissions") or {}
+            lines = ["权限提升审批", f"thread: {params.get('threadId')}", f"turn: {params.get('turnId')}"]
+            reason = str(params.get("reason") or "").strip()
+            if reason:
+                lines.extend(["", "原因", reason])
+            file_system = permissions.get("fileSystem") if isinstance(permissions, dict) else None
+            network = permissions.get("network") if isinstance(permissions, dict) else None
+            if file_system:
+                lines.append("")
+                lines.append("文件系统")
+                read_roots = file_system.get("read") or []
+                write_roots = file_system.get("write") or []
+                if read_roots:
+                    lines.extend(f"- 读: {path}" for path in read_roots[:4])
+                if write_roots:
+                    lines.extend(f"- 写: {path}" for path in write_roots[:4])
+            if network:
+                lines.append("")
+                lines.append(f"网络: {json.dumps(network, ensure_ascii=False)}")
+            return "\n".join(lines)
+
+        return f"待审批请求\n{method}"
+
+    async def handle_server_request(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        self._purge_expired_pending()
+        raw_method = str(payload.get("method") or "")
+        method = self._normalize_method(raw_method)
+        if method not in {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+            "item/tool/requestUserInput",
+            "item/tool/call",
+            "mcpServer/elicitation/request",
+            "account/chatgptAuthTokens/refresh",
+        }:
+            return None
+        if method == "account/chatgptAuthTokens/refresh":
+            logging.getLogger("codex.approvals").info("忽略 chatgptAuthTokens/refresh 请求")
+            return {}
+        if not self.application:
+            return self._default_result_for_method(method, payload.get("params", {}))
+
+        params = payload.get("params", {})
+        if not isinstance(params, dict):
+            return self._default_result_for_method(method, {})
+
+        thread_id = str(params.get("threadId") or "").strip()
+        turn_id = str(params.get("turnId") or "").strip()
+        item_id = str(params.get("itemId") or "").strip()
+        chat_id = self._resolve_chat_id(thread_id, turn_id)
+        if not chat_id:
+            return self._default_result_for_method(method, params)
+        active = self.conversations.active_by_turn.get(turn_id)
+        if active:
+            if method == "item/tool/requestUserInput":
+                active.stage = "等待输入"
+                append_unique(active.tool_notes, "等待用户补充输入", limit=6)
+            elif method == "mcpServer/elicitation/request":
+                active.stage = "等待 MCP 决策"
+                append_unique(active.tool_notes, "等待 MCP 决策", limit=6)
+            elif method == "item/tool/call":
+                active.stage = "等待动态工具"
+                append_unique(active.tool_notes, "等待动态工具响应", limit=6)
+            else:
+                active.stage = "等待审批"
+                append_unique(active.tool_notes, "等待用户审批", limit=6)
+            await active.push({"type": "status"})
+
+        loop = asyncio.get_running_loop()
+        result_future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        # Keep callback_data compact enough for Telegram inline buttons.
+        token = uuid.uuid4().hex[:16]
+        pending = PendingApproval(
+            token=token,
+            request_id=payload["id"],
+            method=method,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            item_id=item_id,
+            prompt_text=self._build_prompt_text(method, params),
+            result_future=result_future,
+            requested_permissions=params.get("permissions") if method == "item/permissions/requestApproval" else None,
+            user_input_questions=params.get("questions") if method == "item/tool/requestUserInput" and isinstance(params.get("questions"), list) else [],
+            dynamic_tool_name=str(params.get("tool") or "").strip() or None,
+            dynamic_tool_arguments=params.get("arguments") if method == "item/tool/call" else None,
+        )
+        self.pending[token] = pending
+        self._persist_pending(pending)
+        try:
+            sent = await self.application.bot.send_message(
+                chat_id=chat_id,
+                text=pending.prompt_text,
+                reply_markup=build_request_keyboard(pending),
+            )
+        except Exception:
+            self._drop_pending(token)
+            raise
+        pending.message_id = sent.message_id
+        self._persist_pending(pending)
+        try:
+            return await asyncio.wait_for(result_future, timeout=APPROVAL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            if pending.message_id:
+                try:
+                    await self.application.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=pending.message_id,
+                        text=pending.prompt_text + "\n\n审批超时，已自动取消。",
+                    )
+                except Exception:
+                    pass
+            return self._default_result_for_method(method, params)
+        finally:
+            if active:
+                active.stage = "整理结果"
+                await active.push({"type": "status"})
+            self._drop_pending(token)
+
+    def resolve_callback(
+        self,
+        token: str,
+        action: str,
+        extra: list[str] | None = None,
+    ) -> tuple[PendingApproval | None, dict[str, Any] | None]:
+        self._purge_expired_pending()
+        pending = self.pending.get(token)
+        if not pending:
+            return None, None
+        extra = extra or []
+        if pending.method == "item/tool/requestUserInput":
+            if action in {"skip", "cancel", "decline"}:
+                return pending, {"answers": {}}
+            if action == "pick" and len(extra) >= 2:
+                try:
+                    question_index = int(extra[0])
+                    option_index = int(extra[1])
+                except ValueError:
+                    return pending, None
+                if question_index < 0 or question_index >= len(pending.user_input_questions):
+                    return pending, None
+                question = pending.user_input_questions[question_index]
+                if not isinstance(question, dict):
+                    return pending, None
+                options = question.get("options") or []
+                if not isinstance(options, list) or option_index < 0 or option_index >= len(options):
+                    return pending, None
+                option = options[option_index]
+                if not isinstance(option, dict):
+                    return pending, None
+                question_id = str(question.get("id") or f"question_{question_index}").strip()
+                answer = str(option.get("label") or "").strip()
+                if not question_id or not answer:
+                    return pending, None
+                return pending, {"answers": {question_id: {"answers": [answer]}}}
+            return pending, None
+        if pending.method == "mcpServer/elicitation/request":
+            if action in {"decline", "cancel"}:
+                return pending, build_mcp_elicitation_result(action)
+            return pending, None
+        if pending.method == "item/tool/call":
+            if action == "echo":
+                return pending, build_dynamic_tool_result(
+                    pending.dynamic_tool_name or "dynamic-tool",
+                    pending.dynamic_tool_arguments,
+                    success=True,
+                    mode="echo",
+                )
+            if action in {"decline", "cancel"}:
+                return pending, build_dynamic_tool_result(
+                    pending.dynamic_tool_name or "dynamic-tool",
+                    pending.dynamic_tool_arguments,
+                    success=False,
+                    mode=action,
+                )
+            return pending, None
+        if pending.method == "item/permissions/requestApproval":
+            if action == "session":
+                return pending, {"permissions": pending.requested_permissions or {}, "scope": "session"}
+            if action == "once":
+                return pending, {"permissions": pending.requested_permissions or {}, "scope": "turn"}
+            return pending, {"permissions": {}, "scope": "turn"}
+        decision_map = {
+            "once": "accept",
+            "session": "acceptForSession",
+            "decline": "decline",
+            "cancel": "cancel",
+        }
+        decision = decision_map.get(action)
+        if not decision:
+            return pending, None
+        return pending, {"decision": decision}
 
 
 async def save_telegram_file(
@@ -2673,7 +4314,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "/archive 归档当前线程 / Archive current thread",
             "/cleanup_threads 批量归档这个 chat 的旧线程 / Cleanup old threads",
             "/verbose [off|thinking|new|all|verbose] 设置消息显示档位 / Display mode",
-            "/access [default|full] 切换访问权限 / Access mode",
+            "/access [default|full] 切换访问权限，full 需确认 / Access mode",
             "/model [模型名] 查看或切换模型 / Model",
             "/effort [minimal|low|medium|high|xhigh] 查看或切换思考强度 / Effort",
             "/status 看当前线程 / Status",
@@ -2893,13 +4534,45 @@ async def access_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     raw = context.args[0].strip().lower()
     if raw in {"default", "normal"}:
         sandbox = settings.codex_default_sandbox
+        require_confirm = False
     elif raw in {"full", "danger", "full-access"}:
         sandbox = "danger-full-access"
+        require_confirm = True
     else:
         await update.effective_message.reply_text(
             "访问权限无效。\n可用值: default, full"
         )
         return
+
+    confirmed = len(context.args) >= 2 and context.args[1].strip().lower() == "confirm"
+    if require_confirm and not confirmed:
+        store.set_full_access_confirm_requested_at(chat_id, time.time())
+        ttl_note = (
+            f"TTL: {settings.full_access_ttl_seconds}s"
+            if settings.full_access_ttl_seconds > 0
+            else "TTL: 关闭"
+        )
+        await update.effective_message.reply_text(
+            "\n".join(
+                [
+                    "即将切换到完全访问权限。",
+                    "这会允许 Codex 直接执行本机命令和修改文件。",
+                    ttl_note,
+                    "确认方式：/access full confirm",
+                ]
+            ),
+            reply_markup=build_full_access_confirmation_keyboard(),
+        )
+        return
+
+    if require_confirm:
+        requested_at = store.get_full_access_confirm_requested_at(chat_id)
+        if not requested_at or time.time() - requested_at > FULL_ACCESS_CONFIRM_WINDOW_SECONDS:
+            store.set_full_access_confirm_requested_at(chat_id, None)
+            await update.effective_message.reply_text(
+                "确认已过期。请重新执行 /access full。"
+            )
+            return
 
     old_thread_id = store.get_thread_id(chat_id)
     if old_thread_id and settings.auto_archive_on_new:
@@ -2911,6 +4584,16 @@ async def access_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         store.clear_thread_id(chat_id)
     store.set_sandbox(chat_id, sandbox)
+    store.set_full_access_confirm_requested_at(chat_id, None)
+    if sandbox == "danger-full-access":
+        expires_at = (
+            time.time() + settings.full_access_ttl_seconds
+            if settings.full_access_ttl_seconds > 0
+            else None
+        )
+        store.set_full_access_expires_at(chat_id, expires_at)
+    else:
+        store.set_full_access_expires_at(chat_id, None)
     await update.effective_message.reply_text(
         f"已切换访问权限: {describe_access_mode(settings, sandbox)}\n"
         f"sandbox: {sandbox}\n"
@@ -2945,8 +4628,9 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             repo_key,
         )
         current = effective_model or settings.codex_model or "gpt-5.4"
+        catalog, source = await get_model_catalog(client)
         suggested = "\n".join(
-            f"{item['label']} -> {item['slug']}" for item in get_available_models()
+            f"{item['label']} -> {item['slug']}" for item in catalog
         )
         await update.effective_message.reply_text(
             "\n".join(
@@ -2955,6 +4639,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     "用法: /model <模型名>",
                     "恢复默认: /model default",
                     f"默认模型: {format_model_name(settings.codex_model or 'gpt-5.4')} -> {settings.codex_model or 'gpt-5.4'}",
+                    f"模型来源: {source}",
                     "",
                     "本机模型列表",
                     suggested,
@@ -2965,12 +4650,14 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     raw = context.args[0].strip()
     if raw.lower() == "list":
+        catalog, source = await get_model_catalog(client)
         await update.effective_message.reply_text(
-            "本机模型列表\n"
-            + "\n".join(f"{item['label']} -> {item['slug']}" for item in get_available_models())
+            f"模型列表 ({source})\n"
+            + "\n".join(f"{item['label']} -> {item['slug']}" for item in catalog)
         )
         return
-    model = None if raw.lower() in {"default", "reset", "auto"} else resolve_model_alias(raw)
+    catalog, _ = await get_model_catalog(client)
+    model = None if raw.lower() in {"default", "reset", "auto"} else resolve_model_alias(raw, catalog)
     old_thread_id = store.get_thread_id(chat_id)
     if old_thread_id and settings.auto_archive_on_new:
         try:
@@ -3012,7 +4699,8 @@ async def effort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chat_id,
         repo_key,
     )
-    allowed_efforts = get_supported_efforts_for_model(active_model or settings.codex_model)
+    catalog, source = await get_model_catalog(client)
+    allowed_efforts = get_supported_efforts_for_model(active_model or settings.codex_model, catalog)
 
     if not context.args:
         current = format_effort_name(effective_effort or settings.codex_reasoning_effort)
@@ -3024,6 +4712,7 @@ async def effort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     f"用法: /effort <{allowed}>",
                     "恢复默认: /effort default",
                     f"当前模型: {format_model_name(active_model or settings.codex_model or 'gpt-5.4')}",
+                    f"模型来源: {source}",
                     "常用档位: low(低), medium(中), high(高), xhigh(超高)",
                 ]
             )
@@ -3168,6 +4857,7 @@ async def cleanup_threads_command(
             continue
         try:
             await client.archive_thread(thread_id)
+            invalidate_local_thread_index_cache()
             archived_count += 1
         except Exception:
             failed.append(thread_id)
@@ -3506,6 +5196,7 @@ async def dispatch_chat_message(
     *,
     prompt: str,
     force_new: bool = False,
+    input_items: list[dict[str, Any]] | None = None,
 ) -> None:
     settings: Settings = context.application.bot_data["settings"]
     store: SessionStore = context.application.bot_data["store"]
@@ -3519,10 +5210,14 @@ async def dispatch_chat_message(
     assert update.effective_chat is not None
     chat_id = update.effective_chat.id
     prompt = prompt.strip()
-    if not prompt:
+    display_prompt = prompt
+    prepared_items = input_items
+    if prepared_items is None:
+        display_prompt, prepared_items = build_structured_input(prompt=prompt)
+    if not display_prompt and not prepared_items:
         await update.effective_message.reply_text("发点实际内容。")
         return
-    if len(prompt) > settings.max_prompt_chars:
+    if len(display_prompt) > settings.max_prompt_chars:
         await update.effective_message.reply_text(
             f"消息太长，当前限制 {settings.max_prompt_chars} 字。"
         )
@@ -3536,7 +5231,7 @@ async def dispatch_chat_message(
     active = conversations.get_active(chat_id)
     if active and not force_new:
         try:
-            await conversations.steer_chat_turn(chat_id, prompt)
+            await conversations.steer_chat_turn(chat_id, display_prompt, prepared_items)
             return
         except Exception as exc:
             lowered = str(exc).lower()
@@ -3557,8 +5252,9 @@ async def dispatch_chat_message(
         turn = await conversations.start_chat_turn(
             chat_id,
             repo_key,
-            prompt,
+            display_prompt,
             force_new=force_new,
+            input_items=prepared_items,
         )
     except RuntimeError as exc:
         await update.effective_message.reply_text(str(exc))
@@ -3647,11 +5343,16 @@ async def media_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("这类附件我还没识别到。")
         return
 
+    display_prompt, input_items = build_structured_input(
+        prompt=caption or "请根据附件继续处理。",
+        attachments=attachments,
+    )
     await dispatch_chat_message(
         update,
         context,
-        prompt=build_attachment_prompt(user_text=caption, attachments=attachments),
+        prompt=display_prompt,
         force_new=False,
+        input_items=input_items,
     )
 
 
@@ -3695,11 +5396,86 @@ async def thread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         client: CodexAppServerClient = context.application.bot_data["client"]
         try:
             await client.archive_thread(selector)
+            invalidate_local_thread_index_cache()
             if store.get_thread_id(update.effective_chat.id) == selector:
                 store.clear_thread_id(update.effective_chat.id)
             await query.message.reply_text(f"已归档线程\n{selector}")
         except Exception as exc:
             await query.message.reply_text(f"归档失败\n{type(exc).__name__}: {exc}")
+
+
+async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    approvals: ApprovalManager = context.application.bot_data["approvals"]
+    store: SessionStore = context.application.bot_data["store"]
+    query = update.callback_query
+    if not query or not update.effective_chat:
+        return
+    if not ensure_authorized(update, settings):
+        await query.answer("未授权", show_alert=True)
+        return
+    await query.answer()
+
+    parts = (query.data or "").split(":")
+    if len(parts) < 3 or parts[0] != APPROVAL_CALLBACK_PREFIX:
+        return
+
+    token = parts[1]
+    action = parts[2]
+    extra = parts[3:]
+    pending, result = approvals.resolve_callback(token, action, extra)
+    if not pending or not result:
+        await query.message.reply_text("这个审批已经结束或不存在。")
+        return
+    if pending.stale or pending.result_future is None:
+        approvals._drop_pending(token)
+        turn: ActiveTurn | None = None
+        try:
+            turn = await approvals.recover_stale_request(
+                context.application,
+                pending,
+                action,
+                result,
+            )
+        except Exception as exc:
+            logging.getLogger("codex.approvals").warning("恢复 stale request 失败: %s", exc)
+        summary_lines = [
+            pending.prompt_text,
+            "",
+            f"已记录操作: {approvals._format_result_for_message(pending, action, result)}",
+        ]
+        if turn:
+            summary_lines.append("已在原线程继续处理。")
+            placeholder_id: int | None = None
+            if get_chat_verbose(store, pending.chat_id) != "off" and query.message:
+                placeholder = await query.message.reply_text("思考中…")
+                placeholder_id = placeholder.message_id
+            asyncio.create_task(
+                stream_turn_to_telegram(
+                    context.application,
+                    turn,
+                    placeholder_id,
+                    settings,
+                )
+            )
+        else:
+            summary_lines.append("当前线程已经恢复；需要在这个线程里重新触发一次。")
+        try:
+            await query.edit_message_text("\n".join(summary_lines))
+        except BadRequest:
+            pass
+        return
+    if not pending.result_future.done():
+        pending.result_future.set_result(result)
+    summary_lines = [
+        pending.prompt_text,
+        "",
+        f"审批结果: {approvals._format_result_for_message(pending, action, result)}",
+    ]
+    try:
+        await query.edit_message_text("\n".join(summary_lines))
+    except BadRequest:
+        pass
 
 
 async def control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3763,6 +5539,22 @@ async def control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await new_command(update, context)
         return
 
+    if action == "access_confirm" and len(parts) >= 3:
+        context.args = [parts[2], "confirm"]
+        await access_command(update, context)
+        return
+
+    if action == "access_cancel":
+        store.set_full_access_confirm_requested_at(chat_id, None)
+        try:
+            await query.edit_message_text(
+                text="已取消完全访问权限切换。",
+                reply_markup=build_control_keyboard(),
+            )
+        except BadRequest:
+            pass
+        return
+
     if action == "access" and len(parts) >= 3:
         context.args = [parts[2]]
         await access_command(update, context)
@@ -3782,6 +5574,7 @@ async def control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def register_telegram_menu(application: Application) -> None:
     # 让 Telegram 客户端左下角的 Menu 和 "/" 提示都显示这份命令表。
     commands = [BotCommand(name, desc) for name, desc in telegram_menu_commands()]
+    install_polling_probe(application.bot, application)
     try:
         await application.bot.set_my_commands(commands)
         await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -3792,17 +5585,25 @@ async def register_telegram_menu(application: Application) -> None:
         health.last_ok_at = time.time()
     if application.job_queue:
         application.job_queue.run_repeating(
-            monitor_polling_health,
-            interval=30,
-            first=30,
+            monitor_bridge_health,
+            interval=10,
+            first=10,
             name="polling-health",
         )
+    asyncio.create_task(warm_local_thread_index_cache())
 
 
-async def monitor_polling_health(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def monitor_bridge_health(context: ContextTypes.DEFAULT_TYPE) -> None:
     application = context.application
     settings: Settings = application.bot_data["settings"]
     health: PollingHealth = application.bot_data["health"]
+    if health.reconnect_notice_pending and health.last_disconnect_at:
+        if health.last_ok_at and health.last_ok_at >= health.last_disconnect_at:
+            await complete_reconnect_notice(
+                application,
+                health.last_disconnect_at,
+                health.last_ok_at,
+            )
     if not health.last_conflict_at:
         return
     if health.alerted_conflict:
@@ -3833,6 +5634,11 @@ async def telegram_error_handler(
         health.last_conflict_at = time.time()
         health.last_error_text = str(error)
         return
+    if isinstance(error, (NetworkError, TimedOut)):
+        health.last_disconnect_at = time.time()
+        health.reconnect_notice_pending = True
+        health.last_error_text = f"{type(error).__name__}: {error}"
+        return
     if error:
         health.last_error_text = f"{type(error).__name__}: {error}"
 
@@ -3847,13 +5653,18 @@ def build_application(settings: Settings) -> Application:
     store = SessionStore(settings.state_dir / "sessions.json")
     client = CodexAppServerClient(settings)
     conversations = ConversationManager(settings, store, client)
+    approvals = ApprovalManager(settings, store, conversations)
     health = PollingHealth()
     edit_queue = TelegramEditQueue()
+    approvals.bind_application(application)
+    client.add_server_request_handler(approvals.handle_server_request)
+    client.add_notification_handler(approvals.handle_notification)
 
     application.bot_data["settings"] = settings
     application.bot_data["store"] = store
     application.bot_data["client"] = client
     application.bot_data["conversations"] = conversations
+    application.bot_data["approvals"] = approvals
     application.bot_data["health"] = health
     application.bot_data["edit_queue"] = edit_queue
 
@@ -3877,6 +5688,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("stop", stop_command))
     application.add_handler(CommandHandler("task", task_command))
     application.add_handler(CommandHandler("continue", continue_command))
+    application.add_handler(CallbackQueryHandler(approval_callback, pattern=r"^approval:"))
     application.add_handler(CallbackQueryHandler(thread_callback, pattern=r"^thread:"))
     application.add_handler(CallbackQueryHandler(control_callback, pattern=r"^control:"))
     application.add_handler(

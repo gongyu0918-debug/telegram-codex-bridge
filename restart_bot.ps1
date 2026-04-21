@@ -5,21 +5,27 @@ $python = "python"
 $errLog = Join-Path $projectRoot "bot.err.log"
 $outLog = Join-Path $projectRoot "bot.out.log"
 $lockFile = Join-Path $projectRoot "bot.lock"
+$bridgeMarker = "--bridge-root"
+$bridgeMarkerValue = $projectRoot
 
-# 先按锁文件 PID 杀一次。
+# Stop the PID from bot.lock first when available.
 if (Test-Path $lockFile) {
-    try {
-        $lockedPid = [int](Get-Content $lockFile -Raw).Trim()
+    $rawLockedPid = (Get-Content $lockFile -Raw -ErrorAction SilentlyContinue | Out-String).Trim()
+    $lockedPid = 0
+    $parsed = [int]::TryParse($rawLockedPid, [ref]$lockedPid)
+    if ($parsed) {
         if ($lockedPid -gt 0) {
             Stop-Process -Id $lockedPid -Force -ErrorAction SilentlyContinue
         }
-    } catch {
     }
+}
 
-# 再杀掉所有 bot.py 实例，避免 Telegram 轮询冲突。
+# Then stop any remaining bot.py processes to avoid Telegram polling conflicts.
 Get-CimInstance Win32_Process |
     Where-Object {
-        $_.CommandLine -match '(?i)(^|["\s])bot\.py($|["\s])'
+        $_.CommandLine -like "*bot.py*" -and
+        $_.CommandLine -like "*$bridgeMarker*" -and
+        $_.CommandLine -like "*$bridgeMarkerValue*"
     } |
     ForEach-Object {
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
@@ -28,8 +34,9 @@ Get-CimInstance Win32_Process |
 Start-Sleep -Seconds 2
 Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
 
-Start-Process -FilePath $python `
-    -ArgumentList "bot.py" `
+Start-Process `
+    -FilePath $python `
+    -ArgumentList @("bot.py", $bridgeMarker, $bridgeMarkerValue) `
     -WorkingDirectory $projectRoot `
     -RedirectStandardOutput $outLog `
     -RedirectStandardError $errLog `

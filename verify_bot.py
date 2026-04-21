@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -57,6 +58,12 @@ class FakeBot:
         self.messages[message_id] = text
         return FakeSentMessage(self, chat_id, message_id, text)
 
+    async def get_me(self):
+        return SimpleNamespace(id=1, is_bot=True, username="verify_bot")
+
+    async def get_updates(self, *args, **kwargs):
+        return []
+
     def all_text(self) -> str:
         sent = [text for _, text in self.sent_records]
         edited = [text for _, text in self.edited_records]
@@ -88,12 +95,14 @@ def make_application(
     client: bot.CodexAppServerClient,
     conversations: bot.ConversationManager,
 ) -> SimpleNamespace:
+    approvals = bot.ApprovalManager(settings, store, conversations)
     return SimpleNamespace(
         bot_data={
             "settings": settings,
             "store": store,
             "client": client,
             "conversations": conversations,
+            "approvals": approvals,
             "health": bot.PollingHealth(last_ok_at=time.time()),
             "edit_queue": bot.TelegramEditQueue(),
         },
@@ -166,9 +175,12 @@ async def verify() -> int:
             encoding="utf-8",
         )
         store = bot.SessionStore(temp_store_path)
+        store.data["pending_requests"] = {}
+        store.save()
         client = bot.CodexAppServerClient(settings)
         conversations = bot.ConversationManager(settings, store, client)
         application = make_application(settings, store, client, conversations)
+        application.bot_data["approvals"].bind_application(application)
 
         repo_key = store.get_repo_key(chat_id)
         if repo_key not in settings.repos:
@@ -183,6 +195,27 @@ async def verify() -> int:
             target_thread = None
         else:
             print(f"threads: ok ({len(local_threads)})")
+            cached_threads = bot.list_local_threads(repo_path, store.get_thread_history(chat_id), limit=15)
+            if [item["id"] for item in cached_threads] == [item["id"] for item in local_threads]:
+                print("threads(cache): ok")
+            else:
+                failures.append("threads(cache): 本地线程缓存结果不稳定")
+            if bot.LOCAL_THREAD_INDEX_CACHE_PATH.exists():
+                bot.LOCAL_THREAD_INDEX.signature = None
+                bot.LOCAL_THREAD_INDEX.entries = []
+                bot.LOCAL_THREAD_INDEX.by_thread_id = {}
+                bot.LOCAL_THREAD_INDEX.last_loaded_at = 0.0
+                persisted_threads = bot.list_local_threads(
+                    repo_path,
+                    store.get_thread_history(chat_id),
+                    limit=15,
+                )
+                if [item["id"] for item in persisted_threads] == [item["id"] for item in local_threads]:
+                    print("threads(cache:persisted): ok")
+                else:
+                    failures.append("threads(cache:persisted): 持久化索引回读结果不稳定")
+            else:
+                failures.append("threads(cache:persisted): 没有写出持久化索引文件")
             mine_threads, repo_recent_threads = bot.split_thread_sections(
                 local_threads,
                 store.get_thread_history(chat_id),
@@ -261,6 +294,43 @@ async def verify() -> int:
         else:
             print(f"status(runtime): ok model={model or 'default'} effort={effort or 'default'}")
 
+        if target_thread:
+            store.set_thread_id(chat_id, target_thread["id"])
+            store.set_runtime_snapshot(
+                chat_id,
+                thread_id=target_thread["id"],
+                model="gpt-5.4",
+                effort="medium",
+            )
+            reroute_turn = bot.ActiveTurn(
+                chat_id=chat_id,
+                repo_key=repo_key,
+                repo_path=repo_path,
+                thread_id=target_thread["id"],
+                turn_id="verify-reroute-turn",
+                prompt="验证模型 reroute",
+            )
+            conversations.active_by_chat[chat_id] = reroute_turn
+            conversations.active_by_turn[reroute_turn.turn_id] = reroute_turn
+            await conversations._handle_notification(
+                {
+                    "method": "model/rerouted",
+                    "params": {
+                        "threadId": target_thread["id"],
+                        "turnId": reroute_turn.turn_id,
+                        "fromModel": "gpt-5.4",
+                        "toModel": "gpt-5.4-mini",
+                        "reason": "highRiskCyberActivity",
+                    },
+                }
+            )
+            reroute_runtime = store.get_runtime_snapshot(chat_id)
+            if reroute_runtime[1] == "gpt-5.4-mini":
+                print("runtime(rerouted): ok")
+            else:
+                failures.append("runtime(rerouted): runtime snapshot 没有跟随 reroute")
+            conversations._finish_turn(reroute_turn)
+
         if settings.codex_model != "gpt-5.4":
             failures.append(f"default(model): 当前默认模型是 {settings.codex_model!r}")
         else:
@@ -271,15 +341,94 @@ async def verify() -> int:
             )
         else:
             print("default(effort): ok")
-        available_models = bot.get_available_models()
+        available_models, model_source = await bot.get_model_catalog(client)
         if not available_models:
             failures.append("models(sync): 没有读到本机模型列表")
         else:
-            print(f"models(sync): ok ({len(available_models)})")
-        if "medium" not in bot.get_supported_efforts_for_model("gpt-5.4"):
+            print(f"models(sync): ok ({len(available_models)}) source={model_source}")
+        if "medium" not in bot.get_supported_efforts_for_model("gpt-5.4", available_models):
             failures.append("efforts(sync): gpt-5.4 没有 medium")
         else:
             print("efforts(sync): ok")
+
+        _, structured_items = bot.build_structured_input(
+            prompt=(
+                "[$talk-normal](C:/Users/admin/.codex/skills/talk-normal/SKILL.md) "
+                "[GitHub](app://github) 修复这个桥接"
+            )
+        )
+        item_types = [item.get("type") for item in structured_items]
+        if "skill" in item_types and "mention" in item_types:
+            print("skills(mentions): ok")
+        else:
+            failures.append("skills(mentions): 没有把 skill / mention 编进输入项")
+
+        runtime_config = bot.build_thread_runtime_config(settings, store, chat_id)
+        skill_thread_id = None
+        try:
+            skill_thread_id = await client.start_thread(repo_path, runtime_config)
+            skill_items = [
+                {"type": "text", "text": "Reply exactly SKILL_INPUT_OK and nothing else.", "text_elements": []},
+                {
+                    "type": "skill",
+                    "name": "talk-normal",
+                    "path": "C:/Users/admin/.codex/skills/talk-normal/SKILL.md",
+                },
+            ]
+            skill_reply = await bot.run_single_prompt(
+                client,
+                skill_thread_id,
+                "Reply exactly SKILL_INPUT_OK and nothing else.",
+                input_items=skill_items,
+                timeout_seconds=120,
+            )
+            if skill_reply.strip() == "SKILL_INPUT_OK":
+                print("multimodal(skill): ok")
+            else:
+                failures.append(f"multimodal(skill): 返回 {skill_reply!r}")
+        except Exception as exc:
+            failures.append(f"multimodal(skill): {type(exc).__name__}: {exc}")
+        finally:
+            if skill_thread_id:
+                try:
+                    await client.archive_thread(skill_thread_id)
+                    bot.invalidate_local_thread_index_cache()
+                except Exception:
+                    pass
+
+        image_thread_id = None
+        image_path = temp_dir / "verify-image.png"
+        image_path.write_bytes(
+            base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y1koXcAAAAASUVORK5CYII="
+            )
+        )
+        try:
+            image_thread_id = await client.start_thread(repo_path, runtime_config)
+            image_items = [
+                {"type": "text", "text": "Ignore the image and reply exactly LOCAL_IMAGE_OK.", "text_elements": []},
+                {"type": "localImage", "path": str(image_path.resolve())},
+            ]
+            image_reply = await bot.run_single_prompt(
+                client,
+                image_thread_id,
+                "Ignore the image and reply exactly LOCAL_IMAGE_OK.",
+                input_items=image_items,
+                timeout_seconds=120,
+            )
+            if image_reply.strip().rstrip(".!") == "LOCAL_IMAGE_OK":
+                print("multimodal(localImage): ok")
+            else:
+                failures.append(f"multimodal(localImage): 返回 {image_reply!r}")
+        except Exception as exc:
+            failures.append(f"multimodal(localImage): {type(exc).__name__}: {exc}")
+        finally:
+            if image_thread_id:
+                try:
+                    await client.archive_thread(image_thread_id)
+                    bot.invalidate_local_thread_index_cache()
+                except Exception:
+                    pass
 
         if target_thread:
             original_archive_current_thread = conversations.archive_current_thread
@@ -299,6 +448,7 @@ async def verify() -> int:
                 repo_key_arg: str,
                 prompt: str,
                 force_new: bool = False,
+                input_items=None,
             ) -> bot.ActiveTurn:
                 return bot.ActiveTurn(
                     chat_id=chat_id_arg,
@@ -408,10 +558,20 @@ async def verify() -> int:
                     args=["full"],
                     text="/access full",
                 )
-                if store.get_sandbox(chat_id) == "danger-full-access" and "已切换访问权限" in access_set_bot.all_text():
-                    checks.append(("command(access-set)", "ok"))
+                if "即将切换到完全访问权限" not in access_set_bot.all_text():
+                    failures.append("command(access-set): 没有进入确认流程")
                 else:
-                    failures.append("command(access-set): 切换 full 失败")
+                    access_confirm_bot = await run_command(
+                        bot.access_command,
+                        application,
+                        chat_id,
+                        args=["full", "confirm"],
+                        text="/access full confirm",
+                    )
+                    if store.get_sandbox(chat_id) == "danger-full-access" and "已切换访问权限" in access_confirm_bot.all_text():
+                        checks.append(("command(access-set)", "ok"))
+                    else:
+                        failures.append("command(access-set): 确认 full 失败")
 
                 model_info_bot = await run_command(bot.model_command, application, chat_id, text="/model")
                 if "当前模型" in model_info_bot.all_text():
@@ -573,7 +733,7 @@ async def verify() -> int:
                 original_steer_chat_turn = conversations.steer_chat_turn
                 steer_prompts: list[str] = []
 
-                async def fake_steer_chat_turn(chat_id_arg: int, prompt: str) -> bot.ActiveTurn:
+                async def fake_steer_chat_turn(chat_id_arg: int, prompt: str, input_items=None) -> bot.ActiveTurn:
                     steer_prompts.append(prompt)
                     return active_turn
 
@@ -608,8 +768,17 @@ async def verify() -> int:
                         target.write_bytes(b"fake-image")
                     return target
 
-                async def fake_dispatch_message(update_arg, context_arg, *, prompt: str, force_new: bool = False) -> None:
+                async def fake_dispatch_message(
+                    update_arg,
+                    context_arg,
+                    *,
+                    prompt: str,
+                    force_new: bool = False,
+                    input_items=None,
+                ) -> None:
                     media_prompts.append(prompt)
+                    if input_items is not None:
+                        media_prompts.append(json.dumps(input_items, ensure_ascii=False))
 
                 bot.save_telegram_file = fake_save_file  # type: ignore[assignment]
                 bot.dispatch_chat_message = fake_dispatch_message  # type: ignore[assignment]
@@ -649,7 +818,7 @@ async def verify() -> int:
                     bot.dispatch_chat_message = original_dispatch_message  # type: ignore[assignment]
 
                 joined_media = "\n".join(media_prompts)
-                if "附件" in joined_media and "hello from attachment" in joined_media and "photo-1.jpg" in joined_media:
+                if "附件" in joined_media and "hello from attachment" in joined_media and "\"localImage\"" in joined_media:
                     checks.append(("command(media)", "ok"))
                 else:
                     failures.append("command(media): 图片或文件附件提示没有生成")
@@ -682,6 +851,31 @@ async def verify() -> int:
                 else:
                     failures.append("callback(control:health): 没有返回健康状态")
 
+                reconnect_bot = FakeBot()
+                application.bot = reconnect_bot
+                health = application.bot_data["health"]
+                health.last_disconnect_at = time.time() - 12
+                health.reconnect_notice_pending = True
+                bot.mark_poll_ok(application)
+                await asyncio.sleep(0)
+                if "Telegram 连接已恢复" in reconnect_bot.all_text():
+                    checks.append(("polling(reconnect)", "ok"))
+                else:
+                    failures.append("polling(reconnect): 没有发送恢复通知")
+
+                reconnect_monitor_bot = FakeBot()
+                application.bot = reconnect_monitor_bot
+                health.last_disconnect_at = time.time() - 18
+                health.reconnect_notice_pending = True
+                health.last_reconnect_notice_for = None
+                bot.install_polling_probe(reconnect_monitor_bot, application)
+                await reconnect_monitor_bot.get_updates()
+                await asyncio.sleep(0)
+                if "Telegram 连接已恢复" in reconnect_monitor_bot.all_text():
+                    checks.append(("polling(reconnect:heartbeat)", "ok"))
+                else:
+                    failures.append("polling(reconnect:heartbeat): 轮询成功后没有发恢复通知")
+
                 thread_summary_bot, _ = await run_callback(
                     bot.thread_callback,
                     application,
@@ -692,6 +886,210 @@ async def verify() -> int:
                     checks.append(("callback(thread:summary)", "ok"))
                 else:
                     failures.append("callback(thread:summary): 没有返回摘要")
+
+                approval_manager: bot.ApprovalManager = application.bot_data["approvals"]
+                approval_bot = FakeBot()
+                application.bot = approval_bot
+                approval_manager.bind_application(application)
+                approval_payload = {
+                    "id": 99,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": target_thread["id"],
+                        "turnId": "approval-turn",
+                        "itemId": "approval-item",
+                        "command": "pytest -q",
+                        "cwd": str(repo_path),
+                        "reason": "运行测试",
+                    },
+                }
+                approval_task = asyncio.create_task(approval_manager.handle_server_request(approval_payload))
+                await asyncio.sleep(0)
+                approval_token = next(iter(approval_manager.pending.keys()), "")
+                if not approval_token:
+                    failures.append("approval(flow): 没有挂起审批请求")
+                else:
+                    approval_callback_bot, _ = await run_callback(
+                        bot.approval_callback,
+                        application,
+                        chat_id,
+                        data=f"{bot.APPROVAL_CALLBACK_PREFIX}:{approval_token}:once",
+                    )
+                    approval_result = await approval_task
+                    if approval_result == {"decision": "accept"} and "审批结果: once" in approval_callback_bot.all_text():
+                        checks.append(("approval(flow)", "ok"))
+                    else:
+                        failures.append("approval(flow): Telegram 审批没有完成")
+
+                    restored_application = make_application(settings, store, client, conversations)
+                    stale_token = "restore-after-restart"
+                    store.save_pending_request(
+                        {
+                            "token": stale_token,
+                            "request_id": 199,
+                            "method": "item/commandExecution/requestApproval",
+                            "chat_id": chat_id,
+                            "thread_id": target_thread["id"],
+                            "turn_id": "stale-turn",
+                            "item_id": "stale-item",
+                            "prompt_text": "命令审批",
+                            "created_at": time.time(),
+                        }
+                    )
+                    restored_manager = bot.ApprovalManager(settings, store, conversations)
+                    restored_application.bot_data["approvals"] = restored_manager
+                    restored_manager.bind_application(restored_application)
+                    stale_start_turns: list[str] = []
+                    original_restored_start = conversations.start_chat_turn
+                    original_stream_turn_restored = bot.stream_turn_to_telegram
+
+                    async def fake_restored_start(
+                        chat_id_arg: int,
+                        repo_key_arg: str,
+                        prompt_arg: str,
+                        *,
+                        force_new: bool = False,
+                        input_items=None,
+                    ):
+                        stale_start_turns.append(prompt_arg)
+                        turn = bot.ActiveTurn(
+                            chat_id=chat_id_arg,
+                            repo_key=repo_key_arg,
+                            repo_path=repo_path,
+                            thread_id=target_thread["id"],
+                            turn_id="restored-turn",
+                            prompt=prompt_arg,
+                        )
+                        conversations.active_by_chat[chat_id_arg] = turn
+                        conversations.active_by_turn[turn.turn_id] = turn
+                        return turn
+
+                    async def fake_restored_stream(application_arg, turn_arg, placeholder_id_arg, settings_arg):
+                        return None
+
+                    conversations.start_chat_turn = fake_restored_start  # type: ignore[assignment]
+                    bot.stream_turn_to_telegram = fake_restored_stream  # type: ignore[assignment]
+                    stale_callback_bot, _ = await run_callback(
+                        bot.approval_callback,
+                        restored_application,
+                        chat_id,
+                        data=f"{bot.APPROVAL_CALLBACK_PREFIX}:{stale_token}:once",
+                    )
+                    conversations.start_chat_turn = original_restored_start  # type: ignore[assignment]
+                    bot.stream_turn_to_telegram = original_stream_turn_restored  # type: ignore[assignment]
+                    if "已在原线程继续处理" in stale_callback_bot.all_text() and stale_start_turns:
+                        checks.append(("approval(restore)", "ok"))
+                    else:
+                        failures.append("approval(restore): 重启后的审批恢复没有续上线程")
+
+                user_input_payload = {
+                    "id": 100,
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "threadId": target_thread["id"],
+                        "turnId": "user-input-turn",
+                        "itemId": "user-input-item",
+                        "questions": [
+                            {
+                                "id": "q1",
+                                "header": "模型选择",
+                                "question": "选择一个模型",
+                                "options": [
+                                    {"label": "GPT-5.4", "description": "默认"},
+                                    {"label": "GPT-5.4-Mini", "description": "更快"},
+                                ],
+                            }
+                        ],
+                    },
+                }
+                user_input_task = asyncio.create_task(approval_manager.handle_server_request(user_input_payload))
+                await asyncio.sleep(0)
+                user_input_token = next(iter(approval_manager.pending.keys()), "")
+                if not user_input_token:
+                    failures.append("user-input(flow): 没有挂起用户输入请求")
+                else:
+                    user_input_bot, _ = await run_callback(
+                        bot.approval_callback,
+                        application,
+                        chat_id,
+                        data=f"{bot.APPROVAL_CALLBACK_PREFIX}:{user_input_token}:pick:0:1",
+                    )
+                    user_input_result = await user_input_task
+                    expected_user_input = {"answers": {"q1": {"answers": ["GPT-5.4-Mini"]}}}
+                    if user_input_result == expected_user_input and "审批结果: pick" in user_input_bot.all_text():
+                        checks.append(("user-input(flow)", "ok"))
+                    else:
+                        failures.append("user-input(flow): 没有返回结构化用户输入答案")
+
+                mcp_payload = {
+                    "id": 101,
+                    "method": "mcpServer/elicitation/request",
+                    "params": {
+                        "threadId": target_thread["id"],
+                        "turnId": "mcp-turn",
+                        "itemId": "mcp-item",
+                        "serverName": "demo-server",
+                        "message": "需要决定是否继续调用 MCP。",
+                    },
+                }
+                mcp_task = asyncio.create_task(approval_manager.handle_server_request(mcp_payload))
+                await asyncio.sleep(0)
+                mcp_token = next(iter(approval_manager.pending.keys()), "")
+                if not mcp_token:
+                    failures.append("mcp(flow): 没有挂起 MCP 交互请求")
+                else:
+                    mcp_bot, _ = await run_callback(
+                        bot.approval_callback,
+                        application,
+                        chat_id,
+                        data=f"{bot.APPROVAL_CALLBACK_PREFIX}:{mcp_token}:decline",
+                    )
+                    mcp_result = await mcp_task
+                    if mcp_result == {"action": "decline", "content": None} and "审批结果: decline" in mcp_bot.all_text():
+                        checks.append(("mcp(flow)", "ok"))
+                    else:
+                        failures.append("mcp(flow): MCP 交互请求没有返回 decline 结果")
+
+                tool_payload = {
+                    "id": 102,
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": target_thread["id"],
+                        "turnId": "tool-turn",
+                        "callId": "call-1",
+                        "tool": "demo-tool",
+                        "arguments": {
+                            "city": "Shanghai",
+                            "previewImage": str(image_path.resolve()),
+                        },
+                    },
+                }
+                tool_task = asyncio.create_task(approval_manager.handle_server_request(tool_payload))
+                await asyncio.sleep(0)
+                tool_token = next(iter(approval_manager.pending.keys()), "")
+                if not tool_token:
+                    failures.append("dynamic-tool(flow): 没有挂起动态工具请求")
+                else:
+                    tool_bot, _ = await run_callback(
+                        bot.approval_callback,
+                        application,
+                        chat_id,
+                        data=f"{bot.APPROVAL_CALLBACK_PREFIX}:{tool_token}:echo",
+                    )
+                    tool_result = await tool_task
+                    image_items = [
+                        item
+                        for item in tool_result.get("contentItems", [])
+                        if item.get("type") == "inputImage"
+                    ]
+                    if (
+                        tool_result.get("success")
+                        and image_items
+                        and "审批结果: echo: demo-tool" in tool_bot.all_text()
+                    ):
+                        checks.append(("dynamic-tool(flow)", "ok"))
+                    else:
+                        failures.append("dynamic-tool(flow): 动态工具请求没有返回图文结果")
 
                 for name, status in checks:
                     print(f"{name}: {status}")

@@ -15,7 +15,10 @@ This project is an unofficial community bridge. It uses the Telegram Bot API plu
 - Thread history, resume, archive, full transcript export, and summary
 - Per-chat model, reasoning effort, access mode, and verbosity settings
 - Attachment intake for images and documents
+- Dynamic tool callbacks with text-plus-image content items
 - Health inspection for Telegram polling, Codex app-server, and edit queue
+- Reconnect heartbeat that emits a recovery notice after silent network drops
+- Persistent local thread index cache for faster `/threads`, `/history`, and `/summary`
 - Inline buttons and Telegram command menu with bilingual labels
 
 ## Commands
@@ -34,7 +37,7 @@ This project is an unofficial community bridge. It uses the Telegram Bot API plu
 - `/archive` archive current thread
 - `/cleanup_threads` archive old threads from this chat
 - `/verbose [off|thinking|new|all|verbose]` display mode
-- `/access [default|full]` sandbox mode
+- `/access [default|full]` sandbox mode, `full` requires confirmation
 - `/model [name]` set or inspect model
 - `/effort [minimal|low|medium|high|xhigh]` set or inspect reasoning effort
 - `/stop` interrupt the running turn
@@ -44,7 +47,7 @@ This project is an unofficial community bridge. It uses the Telegram Bot API plu
 ## Quick start
 
 ```powershell
-cd telegram_codex_bridge
+cd telegram-codex-bridge
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
@@ -62,12 +65,14 @@ Example:
 ```env
 TELEGRAM_BOT_TOKEN=123456:replace_me
 ALLOWED_CHAT_IDS=
+ALLOW_ALL_CHATS=false
 REPOS=default=.
 STATE_DIR=./state
 CODEX_COMMAND=cmd /c npx @openai/codex@0.122.0
-CODEX_APPROVAL=never
-CODEX_SANDBOX=danger-full-access
+CODEX_APPROVAL=on-request
+CODEX_SANDBOX=workspace-write
 CODEX_DEFAULT_SANDBOX=workspace-write
+FULL_ACCESS_TTL_SECONDS=1800
 CODEX_MODEL=gpt-5.4
 CODEX_REASONING_EFFORT=medium
 MAX_PROMPT_CHARS=12000
@@ -93,6 +98,8 @@ Pin `CODEX_COMMAND` to a tested Codex CLI version for stability.
 - Recommended: `cmd /c npx @openai/codex@0.122.0`
 - `@latest` is convenient for local experiments
 - fixed versions reduce silent protocol drift between bridge releases and Codex updates
+
+Local private setups can still keep `danger-full-access` in their untracked `.env`. The public template stays on the safer defaults.
 
 ## Protocol snapshot and CI
 

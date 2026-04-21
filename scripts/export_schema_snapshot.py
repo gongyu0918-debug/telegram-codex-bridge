@@ -47,6 +47,8 @@ def main() -> int:
         )
         client_request = read_json(temp_dir / "ClientRequest.json")
         client_notification = read_json(temp_dir / "ClientNotification.json")
+        server_notification = read_json(temp_dir / "ServerNotification.json")
+        server_request = read_json(temp_dir / "ServerRequest.json")
         steer_params = read_json(temp_dir / "v2" / "TurnSteerParams.json")
 
         request_methods = sorted(
@@ -58,6 +60,18 @@ def main() -> int:
         notification_methods = sorted(
             item["properties"]["method"]["enum"][0]
             for item in client_notification.get("oneOf", [])
+            if isinstance(item, dict)
+            and item.get("properties", {}).get("method", {}).get("enum")
+        )
+        server_notification_methods = sorted(
+            item["properties"]["method"]["enum"][0]
+            for item in server_notification.get("oneOf", [])
+            if isinstance(item, dict)
+            and item.get("properties", {}).get("method", {}).get("enum")
+        )
+        server_request_methods = sorted(
+            item["properties"]["method"]["enum"][0]
+            for item in server_request.get("oneOf", [])
             if isinstance(item, dict)
             and item.get("properties", {}).get("method", {}).get("enum")
         )
@@ -73,6 +87,8 @@ def main() -> int:
             "codex_version": version,
             "request_methods": request_methods,
             "notification_methods": notification_methods,
+            "server_notification_methods": server_notification_methods,
+            "server_request_methods": server_request_methods,
             "turn_steer_required": steer_params.get("required", []),
         }
         out_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
