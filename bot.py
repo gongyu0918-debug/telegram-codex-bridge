@@ -4,6 +4,7 @@ import atexit
 import asyncio
 import base64
 import ctypes
+import io
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from approvals import (
     APPROVAL_TIMEOUT_SECONDS,
@@ -594,6 +596,9 @@ class ActiveTurn:
     prompt: str
     started_at: float = field(default_factory=time.time)
     text: str = ""
+    text_parts: list[str] = field(default_factory=list)
+    text_length: int = 0
+    text_dirty: bool = False
     final_text: str = ""
     error_text: str | None = None
     stage: str = "准备中"
@@ -616,6 +621,28 @@ class ActiveTurn:
             yield event
             if event["type"] in {"done", "error", "interrupted"}:
                 return
+
+    def current_length(self) -> int:
+        if self.text_parts:
+            return self.text_length
+        return len(self.text)
+
+    def append_text_delta(self, delta: str) -> None:
+        if not delta:
+            return
+        if not self.text_parts and self.text:
+            self.text_parts = [self.text]
+            self.text_length = len(self.text)
+        self.text_parts.append(delta)
+        self.text_length += len(delta)
+        self.text_dirty = True
+
+    def materialize_text(self) -> str:
+        if self.text_parts and (self.text_dirty or not self.text):
+            self.text = "".join(self.text_parts)
+            self.text_dirty = False
+            self.text_length = len(self.text)
+        return self.text
 
 
 def shorten_middle(text: str, limit: int = 120) -> str:
@@ -1524,20 +1551,20 @@ class ConversationManager:
                 return
             if turn.stage in {"准备中", "理解需求"}:
                 turn.stage = "整理结果"
-            turn.text += delta
-            await turn.push({"type": "delta", "text": turn.text})
+            turn.append_text_delta(delta)
+            await turn.push({"type": "delta", "delta": delta, "length": turn.current_length()})
             return
 
         if method == "item/completed":
             item = params.get("item", {})
             await self._handle_completed_item(turn, item)
             if item.get("type") == "agentMessage":
-                turn.final_text = item.get("text", "") or turn.text
+                turn.final_text = item.get("text", "") or turn.materialize_text()
             return
 
         if method == "turn/completed":
             turn.stage = "完成"
-            text = turn.final_text or turn.text
+            text = turn.final_text or turn.materialize_text()
             await turn.push({"type": "done", "text": text})
             self._finish_turn(turn)
             return
@@ -1650,6 +1677,23 @@ class ConversationManager:
                         {"type": "tool", "kind": "patch_output", "files": changed_files}
                     )
                     await turn.push({"type": "status"})
+            return
+
+        if item_type == "dynamicToolCall":
+            tool_name = str(item.get("tool") or "dynamic-tool").strip() or "dynamic-tool"
+            text_items, image_items = extract_dynamic_tool_result_parts(item.get("contentItems"))
+            if text_items or image_items:
+                turn.stage = "整理结果"
+                append_unique(turn.tool_notes, f"动态工具已返回: {tool_name}", limit=6)
+                await turn.push(
+                    {
+                        "type": "media",
+                        "tool_name": tool_name,
+                        "texts": text_items,
+                        "images": image_items,
+                    }
+                )
+                await turn.push({"type": "status"})
             return
 
     def _finish_turn(self, turn: ActiveTurn) -> None:
@@ -2337,7 +2381,24 @@ async def run_single_prompt(
 ) -> str:
     loop = asyncio.get_running_loop()
     result_future: asyncio.Future[str] = loop.create_future()
-    state: dict[str, Any] = {"text": ""}
+    state: dict[str, Any] = {"text": "", "text_parts": [], "text_length": 0, "text_dirty": False}
+
+    def append_state_delta(delta: str) -> None:
+        if not delta:
+            return
+        if not state["text_parts"] and state["text"]:
+            state["text_parts"] = [state["text"]]
+            state["text_length"] = len(state["text"])
+        state["text_parts"].append(delta)
+        state["text_length"] += len(delta)
+        state["text_dirty"] = True
+
+    def materialize_state_text() -> str:
+        if state["text_parts"] and (state["text_dirty"] or not state["text"]):
+            state["text"] = "".join(state["text_parts"])
+            state["text_dirty"] = False
+            state["text_length"] = len(state["text"])
+        return state["text"]
 
     async def handler(payload: dict[str, Any]) -> None:
         method = payload.get("method")
@@ -2349,18 +2410,18 @@ async def run_single_prompt(
         if method == "item/agentMessage/delta":
             delta = params.get("delta", "")
             if delta:
-                state["text"] += delta
+                append_state_delta(delta)
             return
 
         if method == "item/completed":
             item = params.get("item", {})
             if item.get("type") == "agentMessage":
-                state["final_text"] = item.get("text", "") or state["text"]
+                state["final_text"] = item.get("text", "") or materialize_state_text()
             return
 
         if method == "turn/completed":
             if not result_future.done():
-                result_future.set_result(state.get("final_text") or state["text"])
+                result_future.set_result(state.get("final_text") or materialize_state_text())
             return
 
         if method == "error":
@@ -3014,6 +3075,27 @@ def build_dynamic_tool_content_items(tool_name: str, arguments: Any) -> list[dic
     return content_items
 
 
+def extract_dynamic_tool_result_parts(content_items: list[dict[str, Any]] | None) -> tuple[list[str], list[str]]:
+    texts: list[str] = []
+    images: list[str] = []
+    seen_images: set[str] = set()
+    for item in content_items or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip()
+        if item_type == "inputText":
+            text = str(item.get("text") or "").strip()
+            if text:
+                texts.append(text)
+            continue
+        if item_type == "inputImage":
+            image_url = str(item.get("imageUrl") or "").strip()
+            if image_url and image_url not in seen_images:
+                seen_images.add(image_url)
+                images.append(image_url)
+    return texts, images
+
+
 def build_dynamic_tool_result(
     tool_name: str,
     arguments: Any,
@@ -3250,6 +3332,66 @@ async def update_stream_message(
     return message.message_id
 
 
+def decode_data_image_url(image_url: str) -> tuple[io.BytesIO, str] | None:
+    raw = image_url.strip()
+    if not raw.lower().startswith("data:image/"):
+        return None
+    header, _, payload = raw.partition(",")
+    if not payload:
+        return None
+    mime = header[5:].split(";", 1)[0].strip().lower()
+    extension = mime.split("/", 1)[1] if "/" in mime else "png"
+    try:
+        content = base64.b64decode(payload)
+    except Exception:
+        return None
+    stream = io.BytesIO(content)
+    stream.name = f"codex-image.{extension or 'png'}"
+    stream.seek(0)
+    return stream, stream.name
+
+
+def resolve_telegram_media_input(image_url: str) -> tuple[Any, str | None]:
+    raw = image_url.strip()
+    if not raw:
+        raise ValueError("空图片地址")
+    data_image = decode_data_image_url(raw)
+    if data_image:
+        return data_image[0], data_image[1]
+    lowered = raw.lower()
+    if lowered.startswith("file://"):
+        parsed = urlparse(raw)
+        file_path = unquote(parsed.path or "")
+        if re.match(r"^/[A-Za-z]:", file_path):
+            file_path = file_path[1:]
+        return Path(file_path), None
+    if lowered.startswith(("http://", "https://")):
+        return raw, None
+    path = Path(raw)
+    if path.is_absolute() and path.exists():
+        return path, None
+    return raw, None
+
+
+async def send_telegram_image(
+    application: Application,
+    chat_id: int,
+    image_url: str,
+    *,
+    caption: str | None = None,
+) -> None:
+    media, filename = resolve_telegram_media_input(image_url)
+    try:
+        await application.bot.send_photo(chat_id=chat_id, photo=media, caption=caption)
+        return
+    except Exception:
+        if isinstance(media, io.BytesIO):
+            media.seek(0)
+        if filename and isinstance(media, io.BytesIO):
+            media.name = filename
+        await application.bot.send_document(chat_id=chat_id, document=media, caption=caption)
+
+
 async def stream_turn_to_telegram(
     application: Application,
     turn: ActiveTurn,
@@ -3330,23 +3472,42 @@ async def stream_turn_to_telegram(
                         last_status_text = text
 
                 now = time.time()
+                current_length = turn.current_length()
                 should_flush = (
                     not answer_message_ids
-                    or len(turn.text) - last_answer_length >= STREAM_BUFFER_THRESHOLD
+                    or current_length - last_answer_length >= STREAM_BUFFER_THRESHOLD
                     or now - last_answer_flush_at >= max(1.2, settings.stream_edit_interval * 2)
                 )
                 if not should_flush:
                     continue
+                current_text = turn.materialize_text()
                 answer_message_ids, answer_chunks = await sync_text_bubbles(
                     application,
                     turn.chat_id,
                     answer_message_ids,
                     answer_chunks,
-                    turn.text,
+                    current_text,
                     settings.max_message_chars,
                 )
                 last_answer_flush_at = now
-                last_answer_length = len(turn.text)
+                last_answer_length = current_length
+                continue
+
+            if event_type == "media":
+                tool_name = str(event.get("tool_name") or "dynamic-tool").strip() or "dynamic-tool"
+                texts = [str(item).strip() for item in event.get("texts") or [] if str(item).strip()]
+                images = [str(item).strip() for item in event.get("images") or [] if str(item).strip()]
+                if texts:
+                    for chunk in split_message("\n\n".join(texts), settings.max_message_chars):
+                        await application.bot.send_message(chat_id=turn.chat_id, text=chunk)
+                for index, image_url in enumerate(images):
+                    caption = f"{tool_name} 图片结果" if index == 0 else None
+                    await send_telegram_image(
+                        application,
+                        turn.chat_id,
+                        image_url,
+                        caption=caption,
+                    )
                 continue
 
             if event_type == "done":

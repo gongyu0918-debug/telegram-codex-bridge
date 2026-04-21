@@ -39,6 +39,8 @@ class FakeBot:
         self.sent_records: list[tuple[int, str]] = []
         self.edited_records: list[tuple[int, str]] = []
         self.messages: dict[int, str] = {}
+        self.photo_records: list[tuple[int, str | None, str]] = []
+        self.document_records: list[tuple[int, str | None, str]] = []
 
     async def send_message(self, chat_id: int, text: str, reply_markup=None) -> FakeSentMessage:
         message_id = self._next_message_id
@@ -57,6 +59,22 @@ class FakeBot:
         self.edited_records.append((message_id, text))
         self.messages[message_id] = text
         return FakeSentMessage(self, chat_id, message_id, text)
+
+    async def send_photo(self, chat_id: int, photo, caption: str | None = None, **kwargs) -> FakeSentMessage:
+        message_id = self._next_message_id
+        self._next_message_id += 1
+        descriptor = getattr(photo, "name", None) or str(photo)
+        self.photo_records.append((message_id, caption, descriptor))
+        self.messages[message_id] = caption or "[photo]"
+        return FakeSentMessage(self, chat_id, message_id, caption or "")
+
+    async def send_document(self, chat_id: int, document, caption: str | None = None, **kwargs) -> FakeSentMessage:
+        message_id = self._next_message_id
+        self._next_message_id += 1
+        descriptor = getattr(document, "name", None) or str(document)
+        self.document_records.append((message_id, caption, descriptor))
+        self.messages[message_id] = caption or "[document]"
+        return FakeSentMessage(self, chat_id, message_id, caption or "")
 
     async def get_me(self):
         return SimpleNamespace(id=1, is_bot=True, username="verify_bot")
@@ -280,6 +298,77 @@ async def verify() -> int:
                 else:
                     print("interrupt(chain): ok")
                 await conversations.stop_chat_turn(chat_id)
+
+        long_thread_id = None
+        long_thread_client = bot.CodexAppServerClient(settings)
+        resume_client = bot.CodexAppServerClient(settings)
+        try:
+            long_runtime = bot.build_thread_runtime_config(settings, store, chat_id)
+            long_thread_id = await long_thread_client.start_thread(repo_path, long_runtime)
+            expected_rounds = [
+                "LONG_THREAD_ROUND_1_OK",
+                "LONG_THREAD_ROUND_2_OK",
+                "LONG_THREAD_ROUND_3_OK",
+            ]
+            actual_rounds: list[str] = []
+            for marker in expected_rounds:
+                reply = await bot.run_single_prompt(
+                    long_thread_client,
+                    long_thread_id,
+                    f"Reply exactly {marker} and nothing else.",
+                    timeout_seconds=120,
+                )
+                actual_rounds.append(reply.strip())
+            if actual_rounds == expected_rounds:
+                print("long-thread(rounds): ok")
+            else:
+                failures.append(f"long-thread(rounds): {actual_rounds!r}")
+
+            thread_payload = await long_thread_client.read_thread(long_thread_id)
+            turn_count = len(((thread_payload.get("thread") or {}).get("turns") or []))
+            if turn_count >= len(expected_rounds):
+                print(f"long-thread(readback): ok turns={turn_count}")
+            else:
+                failures.append(f"long-thread(readback): turns={turn_count}")
+
+            await long_thread_client.shutdown()
+            resumed_id = await resume_client.resume_thread(long_thread_id, repo_path, long_runtime)
+            if resumed_id != long_thread_id:
+                failures.append(f"restart(resume-thread): {resumed_id!r}")
+            else:
+                print("restart(resume-thread): ok")
+            resumed_reply = await bot.run_single_prompt(
+                resume_client,
+                long_thread_id,
+                "Reply exactly LONG_THREAD_RESUME_OK and nothing else.",
+                timeout_seconds=120,
+            )
+            if resumed_reply.strip() == "LONG_THREAD_RESUME_OK":
+                print("restart(resume-turn): ok")
+            else:
+                failures.append(f"restart(resume-turn): {resumed_reply!r}")
+
+            long_thread_path = bot.find_session_path_by_thread_id(long_thread_id)
+            if long_thread_path and long_thread_path.exists():
+                long_transcript = bot.extract_thread_transcript(long_thread_path)
+                if len(long_transcript) >= len(expected_rounds) * 2:
+                    print(f"long-thread(transcript): ok messages={len(long_transcript)}")
+                else:
+                    failures.append(f"long-thread(transcript): messages={len(long_transcript)}")
+            else:
+                failures.append("long-thread(transcript): missing session path")
+        except Exception as exc:
+            failures.append(f"long-thread(smoke): {type(exc).__name__}: {exc}")
+        finally:
+            if long_thread_id:
+                cleanup_client = resume_client if resume_client.process and resume_client.process.returncode is None else long_thread_client
+                try:
+                    await cleanup_client.archive_thread(long_thread_id)
+                    bot.invalidate_local_thread_index_cache()
+                except Exception:
+                    pass
+            await long_thread_client.shutdown()
+            await resume_client.shutdown()
 
         try:
             model, effort = await bot.resolve_effective_runtime_info(
@@ -1143,6 +1232,15 @@ async def verify() -> int:
             stream_turn.text = "先看了当前实现。\n已经改了 bot.py 和 README.md。"
             await stream_turn.push({"type": "delta", "text": stream_turn.text})
             await asyncio.sleep(0)
+            await stream_turn.push(
+                {
+                    "type": "media",
+                    "tool_name": "image-tool",
+                    "texts": ["图像结果已返回"],
+                    "images": ["data:image/png;base64,aGVsbG8="],
+                }
+            )
+            await asyncio.sleep(0)
             await stream_turn.push({"type": "done", "text": "最终答案\n- bot.py\n- README.md"})
             await stream_task
             stream_text = fake_bot.all_text()
@@ -1154,8 +1252,67 @@ async def verify() -> int:
                 failures.append("stream(layout): 任务卡片缺少结构化状态")
             elif not any("已完成" in text for _, text in fake_bot.edited_records):
                 failures.append("stream(layout): thinking 气泡没有落到完成态")
+            elif not fake_bot.photo_records:
+                failures.append("stream(layout): 图片结果没有发到 Telegram")
             else:
                 print("stream(layout): ok")
+
+            stress_bot = FakeBot()
+            stress_turn = bot.ActiveTurn(
+                chat_id=chat_id,
+                repo_key=repo_key,
+                repo_path=repo_path,
+                thread_id="stress-thread",
+                turn_id="stress-turn",
+                prompt="stress verify",
+            )
+            stress_store = bot.SessionStore(temp_dir / "stress_sessions.json")
+            stress_store.data = json.loads(json.dumps(store.data, ensure_ascii=False))
+            stress_store.set_verbose_level(chat_id, "thinking")
+            stress_application = SimpleNamespace(
+                bot=stress_bot,
+                bot_data={
+                    "store": stress_store,
+                    "conversations": SimpleNamespace(get_active=lambda chat_id_arg: stress_turn),
+                    "edit_queue": bot.TelegramEditQueue(),
+                },
+            )
+            stress_placeholder = await stress_bot.send_message(chat_id=chat_id, text="思考中…")
+            stress_task = asyncio.create_task(
+                bot.stream_turn_to_telegram(
+                    stress_application,
+                    stress_turn,
+                    stress_placeholder.message_id,
+                    settings,
+                )
+            )
+            for index in range(160):
+                chunk = f"第{index:03d}段输出，" + ("内容" * 12)
+                stress_turn.append_text_delta(chunk)
+                await stress_turn.push(
+                    {
+                        "type": "delta",
+                        "delta": chunk,
+                        "length": stress_turn.current_length(),
+                    }
+                )
+                if index % 20 == 0:
+                    await asyncio.sleep(0)
+            stress_final = stress_turn.materialize_text()
+            await stress_turn.push({"type": "done", "text": stress_final})
+            await stress_task
+            stress_text = stress_bot.all_text()
+            if "第159段输出" not in stress_text:
+                failures.append("stress(stream): 超长单轮输出末尾丢失")
+            elif not stress_bot.edited_records:
+                failures.append("stress(stream): 没有发生流式编辑")
+            else:
+                print(
+                    "stress(stream): "
+                    f"sent={len(stress_bot.sent_records)} "
+                    f"edited={len(stress_bot.edited_records)} "
+                    f"photos={len(stress_bot.photo_records)}"
+                )
 
         await client.shutdown()
 

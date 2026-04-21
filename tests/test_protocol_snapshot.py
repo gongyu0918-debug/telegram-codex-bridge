@@ -98,6 +98,37 @@ class ProtocolSnapshotTests(unittest.TestCase):
         self.assertIn("CODEX_DEFAULT_SANDBOX=workspace-write", env_example)
         self.assertIn("ALLOW_ALL_CHATS=false", env_example)
 
+    def test_extract_dynamic_tool_result_parts_collects_text_and_images(self) -> None:
+        texts, images = bot.extract_dynamic_tool_result_parts(
+            [
+                {"type": "inputText", "text": "first"},
+                {"type": "inputImage", "imageUrl": "https://example.com/a.png"},
+                {"type": "inputImage", "imageUrl": "https://example.com/a.png"},
+            ]
+        )
+        self.assertEqual(texts, ["first"])
+        self.assertEqual(images, ["https://example.com/a.png"])
+
+    def test_resolve_telegram_media_input_supports_data_image(self) -> None:
+        media, filename = bot.resolve_telegram_media_input("data:image/png;base64,aGVsbG8=")
+        self.assertTrue(hasattr(media, "read"))
+        self.assertEqual(filename, "codex-image.png")
+
+    def test_active_turn_buffers_deltas_until_materialized(self) -> None:
+        turn = bot.ActiveTurn(
+            chat_id=1,
+            repo_key="default",
+            repo_path=ROOT,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            prompt="长输出测试",
+        )
+        turn.append_text_delta("hello")
+        turn.append_text_delta(" world")
+        self.assertEqual(turn.current_length(), 11)
+        self.assertEqual(turn.text, "")
+        self.assertEqual(turn.materialize_text(), "hello world")
+
 
 class ApprovalManagerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -447,6 +478,43 @@ class ConversationManagerTests(unittest.IsolatedAsyncioTestCase):
         tool_event = await turn.queue.get()
         status_event = await turn.queue.get()
         self.assertEqual(tool_event["kind"], "model_rerouted")
+        self.assertEqual(status_event["type"], "status")
+
+    async def test_dynamic_tool_completed_pushes_media_event(self) -> None:
+        turn = bot.ActiveTurn(
+            chat_id=1,
+            repo_key="default",
+            repo_path=ROOT,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            prompt="测试 dynamic tool 图片",
+        )
+        self.manager.active_by_chat[1] = turn
+        self.manager.active_by_turn["turn-1"] = turn
+
+        await self.manager._handle_notification(
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        "type": "dynamicToolCall",
+                        "tool": "image-tool",
+                        "contentItems": [
+                            {"type": "inputText", "text": "tool text"},
+                            {"type": "inputImage", "imageUrl": "https://example.com/render.png"},
+                        ],
+                    },
+                },
+            }
+        )
+
+        media_event = await turn.queue.get()
+        status_event = await turn.queue.get()
+        self.assertEqual(media_event["type"], "media")
+        self.assertEqual(media_event["tool_name"], "image-tool")
+        self.assertEqual(media_event["texts"], ["tool text"])
+        self.assertEqual(media_event["images"], ["https://example.com/render.png"])
         self.assertEqual(status_event["type"], "status")
 
 
