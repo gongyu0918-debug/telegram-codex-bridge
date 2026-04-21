@@ -10,15 +10,19 @@ This project is an unofficial community bridge. It uses the Telegram Bot API plu
 
 - Persistent chat-to-thread mapping
 - Thinking-style status bubble plus separate tool and answer bubbles
+- Same-turn steering for user interjections while a turn is still running
+- Structured task cards with goal, commands, changed files, and verification hints
 - Thread history, resume, archive, full transcript export, and summary
 - Per-chat model, reasoning effort, access mode, and verbosity settings
 - Attachment intake for images and documents
+- Health inspection for Telegram polling, Codex app-server, and edit queue
 - Inline buttons and Telegram command menu with bilingual labels
 
 ## Commands
 
 - `/start` help and current config
 - `/status` current thread status
+- `/health` bridge and app-server health
 - `/repos` list repos
 - `/repo <name>` switch repo and reset thread
 - `/new` start a fresh thread
@@ -89,6 +93,12 @@ Pin `CODEX_COMMAND` to a tested Codex CLI version for stability.
 - Recommended: `cmd /c npx @openai/codex@0.122.0`
 - `@latest` is convenient for local experiments
 - fixed versions reduce silent protocol drift between bridge releases and Codex updates
+
+## Protocol snapshot and CI
+
+- `python scripts/export_schema_snapshot.py` refreshes the committed app-server protocol snapshot
+- `schema/app-server-0.122.0.snapshot.json` pins the expected `turn/steer` and `initialized` surface
+- GitHub Actions runs `py_compile` plus fixture tests from `tests/`
 
 ## License
 

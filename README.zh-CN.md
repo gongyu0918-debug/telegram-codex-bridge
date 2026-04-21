@@ -10,15 +10,19 @@
 
 - 一个 chat 对应一个持久 `thread_id`
 - `thinking` 状态气泡，加上独立的工具气泡和回答气泡
+- 运行中插话会走同 turn 的 `turn/steer`
+- 结构化任务卡片会显示目标、命令、改动文件和验证线索
 - 历史线程、切回、归档、全文导出、摘要压缩
 - 按 chat 保存模型、思考强度、访问权限、显示档位
 - 支持图片和文件附件
+- `/health` 可查看 Telegram 轮询、Codex app-server 和编辑队列状态
 - slash 菜单和内联按钮采用中英双语
 
 ## 命令
 
 - `/start` 帮助和当前配置
 - `/status` 当前线程状态
+- `/health` 桥接和 app-server 健康状态
 - `/repos` 仓库列表
 - `/repo <name>` 切仓库并重置线程
 - `/new` 新开线程
@@ -89,6 +93,12 @@ AUTO_ARCHIVE_ON_NEW=true
 - 推荐：`cmd /c npx @openai/codex@0.122.0`
 - `@latest` 适合本机追新版
 - 固定版本可以减少桥接层和 Codex 协议一起漂移时的静默兼容问题
+
+## 协议快照和 CI
+
+- `python scripts/export_schema_snapshot.py` 用来刷新仓库里的 app-server 协议快照
+- `schema/app-server-0.122.0.snapshot.json` 固定了当前依赖的 `turn/steer` 和 `initialized`
+- GitHub Actions 会跑 `py_compile` 和 `tests/` 里的 fixture 测试
 
 ## 许可证
 

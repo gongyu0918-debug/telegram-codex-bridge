@@ -42,6 +42,9 @@ VALID_VERBOSE_LEVELS = ("off", "thinking", "new", "all", "verbose")
 THREAD_CALLBACK_PREFIX = "thread"
 STREAM_BUFFER_THRESHOLD = 40
 SUMMARY_MODEL_TIMEOUT_SECONDS = 20
+EDIT_QUEUE_DEBOUNCE_SECONDS = 0.18
+TASK_CARD_COMMAND_LIMIT = 4
+TASK_CARD_FILE_LIMIT = 6
 
 
 def parse_int_set(raw: str) -> set[int]:
@@ -396,6 +399,8 @@ class ActiveTurn:
     running_command: str | None = None
     recent_commands: list[str] = field(default_factory=list)
     modified_files: list[str] = field(default_factory=list)
+    supplemental_prompts: list[str] = field(default_factory=list)
+    test_commands: list[str] = field(default_factory=list)
     tool_notes: list[str] = field(default_factory=list)
     queue: asyncio.Queue[dict[str, Any]] = field(default_factory=asyncio.Queue)
     last_event_at: float = field(default_factory=time.time)
@@ -453,6 +458,26 @@ def extract_updated_files(output_text: str) -> list[str]:
     return cleaned
 
 
+def is_test_like_command(command: str) -> bool:
+    lowered = command.lower()
+    markers = (
+        "pytest",
+        "python -m pytest",
+        "unittest",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "vitest",
+        "jest",
+        "ruff check",
+        "mypy",
+        "py_compile",
+        "go test",
+        "cargo test",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def stage_progress(stage: str) -> int:
     if "准备" in stage or "理解" in stage:
         return 10
@@ -495,22 +520,73 @@ def render_run_status(
         return ""
 
     elapsed = format_elapsed(time.time() - turn.started_at)
-    if state == "running":
-        lines = ["思考中…", f"已运行 {elapsed}"]
-    elif state == "done":
-        lines = ["已完成", f"总用时 {elapsed}"]
-    elif state == "error":
-        lines = ["执行失败", f"总用时 {elapsed}"]
-    else:
-        lines = ["已中断", f"总用时 {elapsed}"]
+    title = {
+        "running": "思考中…",
+        "done": "已完成",
+        "error": "执行失败",
+    }.get(state, "已中断")
+    lines = [
+        title,
+        f"状态: {turn.stage}",
+        f"{'已运行' if state == 'running' else '总用时'} {elapsed}",
+        "",
+        "目标",
+        shorten_middle(turn.prompt, 220),
+    ]
+
+    if turn.supplemental_prompts and verbose in {"new", "all", "verbose"}:
+        lines.extend(
+            [
+                "",
+                "补充指令",
+                *[
+                    f"- {shorten_middle(text, 140)}"
+                    for text in turn.supplemental_prompts[-2:]
+                ],
+            ]
+        )
+
+    if verbose in {"new", "all", "verbose"}:
+        if turn.running_command:
+            lines.extend(["", "当前命令", shorten_middle(turn.running_command, 260)])
+        elif turn.recent_commands:
+            lines.extend(
+                [
+                    "",
+                    "最近命令",
+                    *[
+                        f"- {shorten_middle(command, 160)}"
+                        for command in turn.recent_commands[-TASK_CARD_COMMAND_LIMIT:]
+                    ],
+                ]
+            )
+        if turn.modified_files:
+            lines.extend(
+                [
+                    "",
+                    "已修改文件",
+                    *[f"- {path}" for path in turn.modified_files[-TASK_CARD_FILE_LIMIT:]],
+                ]
+            )
+        if turn.test_commands:
+            lines.extend(
+                [
+                    "",
+                    "验证",
+                    *[
+                        f"- {shorten_middle(command, 160)}"
+                        for command in turn.test_commands[-3:]
+                    ],
+                ]
+            )
 
     if state == "running" and verbose in {"all", "verbose"}:
-        lines.append(f"阶段: {turn.stage}")
         idle_seconds = int(max(0, time.time() - turn.last_event_at))
+        lines.extend(["", "进度", f"- 当前阶段：{turn.stage}"])
         if idle_seconds >= 4:
-            lines.append(f"等待下一段输出: {idle_seconds}s")
-    if state == "running" and turn.running_command and verbose == "verbose":
-        lines.extend(["", "当前命令", shorten_middle(turn.running_command, 240)])
+            lines.append(f"- 等待下一段输出：{idle_seconds}s")
+        if turn.tool_notes:
+            lines.extend(f"- {note}" for note in turn.tool_notes[-4:])
     return trim_for_stream("\n".join(lines), 600)
 
 
@@ -543,6 +619,14 @@ def format_tool_event(event: dict[str, Any], verbose: str) -> str | None:
             ]
         )
 
+    if kind == "steer":
+        if verbose not in {"new", "all", "verbose"}:
+            return None
+        prompt = str(event.get("prompt") or "").strip()
+        if not prompt:
+            return "已追加指令"
+        return "\n".join(["已追加指令", shorten_middle(prompt, 280)])
+
     if kind == "read":
         if verbose not in {"all", "verbose"}:
             return None
@@ -568,6 +652,103 @@ def format_tool_event(event: dict[str, Any], verbose: str) -> str | None:
     return None
 
 
+@dataclass
+class PendingTelegramEdit:
+    message_id: int
+    latest_text: str
+    waiters: list[asyncio.Future[int]] = field(default_factory=list)
+    dirty: bool = True
+    worker: asyncio.Task[None] | None = None
+
+
+class TelegramEditQueue:
+    def __init__(self) -> None:
+        self.pending: dict[tuple[int, int], PendingTelegramEdit] = {}
+        self.lock = asyncio.Lock()
+
+    def pending_count(self) -> int:
+        return len(self.pending)
+
+    async def edit(
+        self,
+        application: Application,
+        chat_id: int,
+        message_id: int,
+        text: str,
+    ) -> int:
+        key = (chat_id, message_id)
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[int] = loop.create_future()
+        async with self.lock:
+            state = self.pending.get(key)
+            if not state:
+                state = PendingTelegramEdit(message_id=message_id, latest_text=text)
+                self.pending[key] = state
+                state.worker = asyncio.create_task(self._worker(application, chat_id, key))
+            state.latest_text = text
+            state.dirty = True
+            state.waiters.append(waiter)
+        return await waiter
+
+    async def _worker(
+        self,
+        application: Application,
+        chat_id: int,
+        key: tuple[int, int],
+    ) -> None:
+        await asyncio.sleep(EDIT_QUEUE_DEBOUNCE_SECONDS)
+        while True:
+            async with self.lock:
+                state = self.pending.get(key)
+                if not state:
+                    return
+                message_id = state.message_id
+                text = state.latest_text
+                waiters = state.waiters[:]
+                state.waiters.clear()
+                state.dirty = False
+            try:
+                new_message_id = await update_stream_message(
+                    application,
+                    chat_id,
+                    message_id,
+                    text,
+                )
+            except Exception as exc:
+                for waiter in waiters:
+                    if not waiter.done():
+                        waiter.set_exception(exc)
+                async with self.lock:
+                    self.pending.pop(key, None)
+                return
+
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(new_message_id)
+
+            async with self.lock:
+                state = self.pending.get(key)
+                if not state:
+                    return
+                state.message_id = new_message_id
+                if not state.dirty and not state.waiters:
+                    self.pending.pop(key, None)
+                    return
+            await asyncio.sleep(EDIT_QUEUE_DEBOUNCE_SECONDS)
+
+
+async def queue_stream_message(
+    application: Application,
+    chat_id: int,
+    message_id: int,
+    text: str,
+) -> int:
+    edit_queue: TelegramEditQueue | None = application.bot_data.get("edit_queue")
+    if not edit_queue:
+        return await update_stream_message(application, chat_id, message_id, text)
+    return await edit_queue.edit(application, chat_id, message_id, text)
+
+
 async def sync_text_bubbles(
     application: Application,
     chat_id: int,
@@ -585,7 +766,7 @@ async def sync_text_bubbles(
         if index < len(current_ids):
             if index < len(previous_chunks) and previous_chunks[index] == chunk:
                 continue
-            current_ids[index] = await update_stream_message(
+            current_ids[index] = await queue_stream_message(
                 application,
                 chat_id,
                 current_ids[index],
@@ -611,9 +792,19 @@ class CodexAppServerClient:
         self.loaded_threads: set[str] = set()
         self.err_log_path = self.settings.state_dir / "app_server.err.log"
         self.log = logging.getLogger("codex.appserver")
+        self.version_cache: str | None = None
 
     def add_notification_handler(self, handler: Any) -> None:
         self.notification_handlers.append(handler)
+
+    def request_timeout_for(self, method: str) -> float:
+        if method in {"initialize", "thread/start", "thread/resume", "thread/read"}:
+            return 60.0
+        if method in {"turn/start", "turn/steer"}:
+            return 45.0
+        if method == "thread/list":
+            return 30.0
+        return 20.0
 
     async def ensure_started(self) -> None:
         async with self.lifecycle_lock:
@@ -682,8 +873,16 @@ class CodexAppServerClient:
                         if not future:
                             continue
                         if "error" in payload:
+                            error = payload["error"]
+                            message = error.get("message", "未知 RPC 错误")
+                            data = error.get("data")
+                            if data:
+                                try:
+                                    message = f"{message}\n{json.dumps(data, ensure_ascii=False)}"
+                                except TypeError:
+                                    message = f"{message}\n{data}"
                             future.set_exception(
-                                RuntimeError(payload["error"].get("message", "未知 RPC 错误"))
+                                RuntimeError(message)
                             )
                         else:
                             future.set_result(payload["result"])
@@ -755,7 +954,7 @@ class CodexAppServerClient:
 
     async def request(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
         await self.ensure_started()
-        timeout_seconds = 20
+        timeout_seconds = self.request_timeout_for(method)
         try:
             return await asyncio.wait_for(
                 self._send_request(method, params),
@@ -829,6 +1028,17 @@ class CodexAppServerClient:
         )
         return response["turn"]["id"]
 
+    async def steer_turn(self, thread_id: str, turn_id: str, prompt: str) -> str:
+        response = await self.request(
+            "turn/steer",
+            {
+                "threadId": thread_id,
+                "expectedTurnId": turn_id,
+                "input": [{"type": "text", "text": prompt, "text_elements": []}],
+            },
+        )
+        return response["turnId"]
+
     async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
         await self.request(
             "turn/interrupt",
@@ -880,6 +1090,25 @@ class CodexAppServerClient:
             },
         )
         return response.get("data", [])
+
+    async def detect_version(self) -> str:
+        if self.version_cache:
+            return self.version_cache
+        command = [*self.settings.codex_command, "--version"]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)
+        except Exception as exc:
+            self.version_cache = f"未知 ({type(exc).__name__})"
+            return self.version_cache
+        text = (stdout + stderr).decode("utf-8", errors="replace").strip()
+        first_line = text.splitlines()[0].strip() if text else ""
+        self.version_cache = first_line or "未知"
+        return self.version_cache
 
 
 def extract_runtime_info_from_session_file(path: Path) -> tuple[str | None, str | None]:
@@ -1027,6 +1256,8 @@ class ConversationManager:
                     turn.stage = "执行命令"
                     turn.running_command = command
                     append_unique(turn.recent_commands, command, limit=10)
+                    if is_test_like_command(command):
+                        append_unique(turn.test_commands, command, limit=6)
                     append_unique(turn.tool_notes, "已开始执行命令", limit=6)
                     await turn.push({"type": "tool", "kind": "shell", "command": command})
                     await turn.push({"type": "status"})
@@ -1079,6 +1310,26 @@ class ConversationManager:
     def _finish_turn(self, turn: ActiveTurn) -> None:
         self.active_by_turn.pop(turn.turn_id, None)
         self.active_by_chat.pop(turn.chat_id, None)
+
+    async def steer_chat_turn(self, chat_id: int, prompt: str) -> ActiveTurn:
+        active = self.get_active(chat_id)
+        if not active:
+            raise RuntimeError("当前没有运行中的回复。")
+        next_turn_id = await self.client.steer_turn(
+            active.thread_id,
+            active.turn_id,
+            prompt,
+        )
+        if next_turn_id != active.turn_id:
+            self.active_by_turn.pop(active.turn_id, None)
+            active.turn_id = next_turn_id
+            self.active_by_turn[next_turn_id] = active
+        active.stage = "吸收补充指令"
+        append_unique(active.supplemental_prompts, prompt, limit=6)
+        append_unique(active.tool_notes, "已追加补充指令", limit=6)
+        await active.push({"type": "tool", "kind": "steer", "prompt": prompt})
+        await active.push({"type": "status"})
+        return active
 
     async def ensure_thread(
         self,
@@ -1373,6 +1624,12 @@ def format_polling_health(health: PollingHealth) -> str:
     return "初始化中"
 
 
+def format_age_line(timestamp: float | None) -> str:
+    if not timestamp:
+        return "未记录"
+    return format_elapsed(time.time() - timestamp) + " 前"
+
+
 def build_thread_keyboard(index: int, thread_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -1393,6 +1650,7 @@ def build_control_keyboard() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton("状态 Status", callback_data="control:status"),
+                InlineKeyboardButton("健康 Health", callback_data="control:health"),
                 InlineKeyboardButton("停止 Stop", callback_data="control:stop"),
                 InlineKeyboardButton("新线程 New", callback_data="control:new"),
             ],
@@ -1826,6 +2084,7 @@ def telegram_menu_commands() -> list[tuple[str, str]]:
     return [
         ("start", "帮助 / Help"),
         ("status", "查看状态 / Status"),
+        ("health", "健康状态 / Health"),
         ("new", "新开线程 / New thread"),
         ("repos", "仓库列表 / Repos"),
         ("repo", "切换仓库 / Switch repo"),
@@ -2108,6 +2367,39 @@ async def build_status_text(
     return "\n".join(lines)
 
 
+async def build_health_text(
+    application: Application,
+    settings: Settings,
+    client: CodexAppServerClient,
+    conversations: ConversationManager,
+    health: PollingHealth,
+) -> str:
+    edit_queue: TelegramEditQueue | None = application.bot_data.get("edit_queue")
+    process = client.process
+    app_server_state = "运行中" if process and process.returncode is None else "未运行"
+    app_server_pid = str(process.pid) if process and process.returncode is None else "无"
+    version = await client.detect_version()
+    lines = [
+        "健康状态",
+        f"bot_pid: {os.getpid()}",
+        f"codex_version: {version}",
+        f"polling: {format_polling_health(health)}",
+        f"last_ok: {format_age_line(health.last_ok_at)}",
+        f"last_conflict: {format_age_line(health.last_conflict_at)}",
+        f"app_server: {app_server_state}",
+        f"app_server_pid: {app_server_pid}",
+        f"active_turns: {len(conversations.active_by_chat)}",
+        f"loaded_threads: {len(client.loaded_threads)}",
+        f"pending_rpc: {len(client.pending)}",
+        f"pending_edits: {edit_queue.pending_count() if edit_queue else 0}",
+        f"state_dir: {settings.state_dir}",
+        f"codex_command: {' '.join(settings.codex_command)}",
+    ]
+    if health.last_error_text:
+        lines.extend(["last_error:", health.last_error_text])
+    return "\n".join(lines)
+
+
 async def save_telegram_file(
     context: ContextTypes.DEFAULT_TYPE,
     file_id: str,
@@ -2208,7 +2500,7 @@ async def stream_turn_to_telegram(
                 text = render_run_status(turn, verbose, state="running")
                 if now - last_status_edit_at < settings.stream_edit_interval or text == last_status_text:
                     continue
-                status_message_id = await update_stream_message(
+                status_message_id = await queue_stream_message(
                     application,
                     turn.chat_id,
                     status_message_id,
@@ -2233,7 +2525,7 @@ async def stream_turn_to_telegram(
                 text = render_run_status(turn, verbose, state="running")
                 if now - last_status_edit_at < settings.stream_edit_interval or text == last_status_text:
                     continue
-                status_message_id = await update_stream_message(
+                status_message_id = await queue_stream_message(
                     application,
                     turn.chat_id,
                     status_message_id,
@@ -2248,7 +2540,7 @@ async def stream_turn_to_telegram(
                     now = time.time()
                     text = render_run_status(turn, verbose, state="running")
                     if now - last_status_edit_at >= settings.stream_edit_interval and text != last_status_text:
-                        status_message_id = await update_stream_message(
+                        status_message_id = await queue_stream_message(
                             application,
                             turn.chat_id,
                             status_message_id,
@@ -2290,7 +2582,7 @@ async def stream_turn_to_telegram(
                 if status_message_id and verbose != "off":
                     done_text = render_run_status(turn, verbose, state="done")
                     if done_text:
-                        await update_stream_message(
+                        await queue_stream_message(
                             application,
                             turn.chat_id,
                             status_message_id,
@@ -2306,7 +2598,7 @@ async def stream_turn_to_telegram(
                 if status_message_id and verbose != "off":
                     fail_text = render_run_status(turn, verbose, state="error")
                     if fail_text:
-                        await update_stream_message(
+                        await queue_stream_message(
                             application,
                             turn.chat_id,
                             status_message_id,
@@ -2319,7 +2611,7 @@ async def stream_turn_to_telegram(
                 if status_message_id and verbose != "off":
                     stop_text = render_run_status(turn, verbose, state="interrupted")
                     if stop_text:
-                        await update_stream_message(
+                        await queue_stream_message(
                             application,
                             turn.chat_id,
                             status_message_id,
@@ -2385,6 +2677,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "/model [模型名] 查看或切换模型 / Model",
             "/effort [minimal|low|medium|high|xhigh] 查看或切换思考强度 / Effort",
             "/status 看当前线程 / Status",
+            "/health 看桥接健康状态 / Health",
             "/stop 中断当前回复 / Stop",
             "",
             "仓库",
@@ -2504,6 +2797,26 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         conversations,
         health,
         chat_id,
+    )
+    await update.effective_message.reply_text(text, reply_markup=build_control_keyboard())
+
+
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    client: CodexAppServerClient = context.application.bot_data["client"]
+    conversations: ConversationManager = context.application.bot_data["conversations"]
+    health: PollingHealth = context.application.bot_data["health"]
+    if not ensure_authorized(update, settings):
+        await reject_unauthorized(update)
+        return
+    mark_poll_ok(context.application)
+    await bootstrap_notice(update, settings)
+    text = await build_health_text(
+        context.application,
+        settings,
+        client,
+        conversations,
+        health,
     )
     await update.effective_message.reply_text(text, reply_markup=build_control_keyboard())
 
@@ -3134,7 +3447,7 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     initial_chunks = split_message(fallback_summary, settings.max_message_chars)
     if initial_chunks:
-        await edit_message_safe(
+        await queue_stream_message(
             context.application,
             chat_id,
             placeholder.message_id,
@@ -3153,7 +3466,7 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             timeout=SUMMARY_MODEL_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
-        await edit_message_safe(
+        await queue_stream_message(
             context.application,
             chat_id,
             placeholder.message_id,
@@ -3164,7 +3477,7 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     except Exception as exc:
-        await edit_message_safe(
+        await queue_stream_message(
             context.application,
             chat_id,
             placeholder.message_id,
@@ -3177,7 +3490,7 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     chunks = split_message(summary or "没有拿到总结结果。", settings.max_message_chars)
     if chunks:
-        await edit_message_safe(
+        await queue_stream_message(
             context.application,
             chat_id,
             placeholder.message_id,
@@ -3222,9 +3535,23 @@ async def dispatch_chat_message(
 
     active = conversations.get_active(chat_id)
     if active and not force_new:
-        stopped = await conversations.stop_chat_turn(chat_id)
-        if stopped:
-            await asyncio.sleep(0.2)
+        try:
+            await conversations.steer_chat_turn(chat_id, prompt)
+            return
+        except Exception as exc:
+            lowered = str(exc).lower()
+            recoverable = (
+                "activeturnnotsteerable" in lowered
+                or "cannot accept same-turn steering" in lowered
+                or "expectedturnid" in lowered
+                or "precondition" in lowered
+            )
+            if not recoverable:
+                await update.effective_message.reply_text(f"追加指令失败\n{type(exc).__name__}: {exc}")
+                return
+            stopped = await conversations.stop_chat_turn(chat_id)
+            if stopped:
+                await asyncio.sleep(0.2)
 
     try:
         turn = await conversations.start_chat_turn(
@@ -3412,6 +3739,20 @@ async def control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
         return
 
+    if action == "health":
+        text = await build_health_text(
+            context.application,
+            settings,
+            client,
+            conversations,
+            health,
+        )
+        try:
+            await query.edit_message_text(text=text, reply_markup=build_control_keyboard())
+        except BadRequest:
+            pass
+        return
+
     if action == "stop":
         context.args = []
         await stop_command(update, context)
@@ -3507,12 +3848,14 @@ def build_application(settings: Settings) -> Application:
     client = CodexAppServerClient(settings)
     conversations = ConversationManager(settings, store, client)
     health = PollingHealth()
+    edit_queue = TelegramEditQueue()
 
     application.bot_data["settings"] = settings
     application.bot_data["store"] = store
     application.bot_data["client"] = client
     application.bot_data["conversations"] = conversations
     application.bot_data["health"] = health
+    application.bot_data["edit_queue"] = edit_queue
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
@@ -3530,6 +3873,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("effort", effort_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("health", health_command))
     application.add_handler(CommandHandler("stop", stop_command))
     application.add_handler(CommandHandler("task", task_command))
     application.add_handler(CommandHandler("continue", continue_command))

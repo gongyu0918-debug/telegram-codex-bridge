@@ -95,6 +95,7 @@ def make_application(
             "client": client,
             "conversations": conversations,
             "health": bot.PollingHealth(last_ok_at=time.time()),
+            "edit_queue": bot.TelegramEditQueue(),
         },
         bot=None,
         job_queue=None,
@@ -369,6 +370,12 @@ async def verify() -> int:
                 else:
                     failures.append("command(status): 缺少 model 或 polling 字段")
 
+                health_bot = await run_command(bot.health_command, application, chat_id, text="/health")
+                if "健康状态" in health_bot.all_text() and "codex_version:" in health_bot.all_text():
+                    checks.append(("command(health)", "ok"))
+                else:
+                    failures.append("command(health): 没有返回健康状态")
+
                 verbose_info_bot = await run_command(bot.verbose_command, application, chat_id, text="/verbose")
                 if "thinking" in verbose_info_bot.all_text():
                     checks.append(("command(verbose-info)", "ok"))
@@ -553,6 +560,41 @@ async def verify() -> int:
                 else:
                     failures.append("command(text): 普通文本入口没有启动")
 
+                active_turn = bot.ActiveTurn(
+                    chat_id=chat_id,
+                    repo_key=repo_key,
+                    repo_path=repo_path,
+                    thread_id="steer-thread",
+                    turn_id="steer-turn",
+                    prompt="已有任务",
+                )
+                conversations.active_by_chat[chat_id] = active_turn
+                conversations.active_by_turn[active_turn.turn_id] = active_turn
+                original_steer_chat_turn = conversations.steer_chat_turn
+                steer_prompts: list[str] = []
+
+                async def fake_steer_chat_turn(chat_id_arg: int, prompt: str) -> bot.ActiveTurn:
+                    steer_prompts.append(prompt)
+                    return active_turn
+
+                conversations.steer_chat_turn = fake_steer_chat_turn  # type: ignore[assignment]
+                try:
+                    steer_bot = await run_command(
+                        bot.text_message,
+                        application,
+                        chat_id,
+                        text="运行中插话",
+                    )
+                finally:
+                    conversations.steer_chat_turn = original_steer_chat_turn  # type: ignore[assignment]
+                    conversations.active_by_chat.pop(chat_id, None)
+                    conversations.active_by_turn.pop(active_turn.turn_id, None)
+
+                if steer_prompts == ["运行中插话"] and "思考中…" not in steer_bot.all_text():
+                    checks.append(("command(steer)", "ok"))
+                else:
+                    failures.append("command(steer): 插话没有走 steer 路径")
+
                 original_save_file = bot.save_telegram_file
                 original_dispatch_message = bot.dispatch_chat_message
                 media_prompts: list[str] = []
@@ -629,6 +671,17 @@ async def verify() -> int:
                 else:
                     failures.append("callback(control:effort): 没有切换思考强度")
 
+                control_health_bot, _ = await run_callback(
+                    bot.control_callback,
+                    application,
+                    chat_id,
+                    data="control:health",
+                )
+                if "健康状态" in control_health_bot.all_text():
+                    checks.append(("callback(control:health)", "ok"))
+                else:
+                    failures.append("callback(control:health): 没有返回健康状态")
+
                 thread_summary_bot, _ = await run_callback(
                     bot.thread_callback,
                     application,
@@ -668,6 +721,7 @@ async def verify() -> int:
                 bot_data={
                     "store": stream_store,
                     "conversations": SimpleNamespace(get_active=lambda chat_id_arg: stream_turn),
+                    "edit_queue": bot.TelegramEditQueue(),
                 },
             )
             placeholder = await fake_bot.send_message(chat_id=chat_id, text="思考中…")
@@ -698,6 +752,8 @@ async def verify() -> int:
                 failures.append("stream(layout): 没有分出工具气泡")
             elif "最终答案" not in stream_text:
                 failures.append("stream(layout): 没有分出回答气泡")
+            elif not any("目标" in text and "状态:" in text for _, text in fake_bot.edited_records):
+                failures.append("stream(layout): 任务卡片缺少结构化状态")
             elif not any("已完成" in text for _, text in fake_bot.edited_records):
                 failures.append("stream(layout): thinking 气泡没有落到完成态")
             else:
